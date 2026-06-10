@@ -43,9 +43,13 @@ vision-tower outputs by image content so repeated images skip the encoder.
 - [x] `QwenVLRunner`: real prefill/decode with per-sequence KV cache — engine
       output is **bit-identical to `model.generate()`**, and concurrent requests
       stay isolated (verified)
-- [ ] Batched forward (fuse sequences into one pass) for throughput
+- [x] Batched decode: all sequences advance in one forward pass (left-padded KV
+      + explicit M-RoPE positions) — token-identical to sequential, **2.6x
+      throughput** (see below)
+- [x] Benchmark vs. vLLM (same workload, separate processes, true peak VRAM)
+- [ ] Batched/chunked prefill
 - [ ] OpenAI-compatible server with SSE streaming
-- [ ] Benchmark vs. vLLM / SGLang
+- [ ] SGLang in the comparison
 
 ## Validated on RTX 4060 Laptop (8 GB)
 Qwen2-VL-2B-Instruct, 4-bit NF4:
@@ -59,6 +63,29 @@ Qwen2-VL-2B-Instruct, 4-bit NF4:
 
 The ~6 GB of headroom is what makes concurrent continuous batching feasible on
 this GPU.
+
+## Result: omniserve vs vLLM
+Same multimodal workload (Qwen2-VL-2B, fp16, 24 concurrent requests, 64 tokens
+each, greedy), each backend in its own process. Both produce identical output
+length (1488 tokens), so the throughput numbers are directly comparable.
+
+| backend | req/s | tok/s | peak VRAM | rel. tok/s |
+|---|---|---|---|---|
+| vLLM 0.12 | 4.73 | 293.1 | 7034 MiB | 1.00x |
+| **omniserve (batched)** | 2.25 | **139.4** | 5028 MiB | **0.48x** |
+| omniserve (sequential, Stage 1) | 0.85 | 52.9 | 4528 MiB | 0.18x |
+
+**The interesting part is *why*.** With sequential decode, omniserve's throughput
+is flat across load (52 tok/s at 4 requests, 53 at 24) — it cannot exploit
+concurrency. vLLM scales ~4x over the same range because it batches the decode
+step. Implementing batched decode (one forward for all running sequences, with
+left-padded KV and explicit M-RoPE positions) lifted omniserve **2.6x** (53 →
+139 tok/s) and closed the gap to vLLM from 5.4x to 2.1x. The remaining gap is
+paged attention, fused kernels, and CUDA graphs — none of which omniserve has.
+This is an honest accounting of what a production engine buys you, measured
+rather than guessed.
+
+Reproduce: `cd benchmarks/compare && python compare.py --requests 24`
 
 ## Result: vision embedding cache
 Sweeping the image reuse rate on Qwen2-VL-2B (4-bit), baseline vs. cached:

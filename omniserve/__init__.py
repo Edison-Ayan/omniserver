@@ -21,3 +21,11 @@ __all__ = [
     "Scheduler",
     "SchedulerConfig",
 ]
+
+
+def __getattr__(name):
+    # Lazy import so the control plane stays importable without torch/transformers.
+    if name == "QwenVLRunner":
+        from .qwen_runner import QwenVLRunner
+        return QwenVLRunner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

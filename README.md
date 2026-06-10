@@ -40,9 +40,12 @@ vision-tower outputs by image content so repeated images skip the encoder.
 - [x] Backend interface + `StubRunner` (control plane tested without a GPU)
 - [x] 4-bit model load validated on RTX 4060 (peak **2.1 GB** VRAM, see below)
 - [x] Vision embedding cache + benchmark harness (real numbers below)
-- [ ] `QwenVLRunner`: real prefill/decode + KV cache + vision cache
+- [x] `QwenVLRunner`: real prefill/decode with per-sequence KV cache — engine
+      output is **bit-identical to `model.generate()`**, and concurrent requests
+      stay isolated (verified)
+- [ ] Batched forward (fuse sequences into one pass) for throughput
 - [ ] OpenAI-compatible server with SSE streaming
-- [ ] Benchmark vs. vLLM / SGLang-Omni
+- [ ] Benchmark vs. vLLM / SGLang
 
 ## Validated on RTX 4060 Laptop (8 GB)
 Qwen2-VL-2B-Instruct, 4-bit NF4:

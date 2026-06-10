@@ -1,10 +1,20 @@
-"""Driver: run the same workload through each backend (in separate processes,
-since each needs most of the 8 GB GPU) and print a comparison table.
+"""Driver for a rigorous omniserve vs vLLM comparison.
 
-    python compare.py --requests 32 --reuse 0.0
+For each backend (separate process, since each needs most of the 8 GB GPU):
+  - production config (vLLM uses CUDA graphs, not enforce_eager)
+  - one warmup pass + N timed trials -> median throughput + spread
+  - true peak VRAM via nvidia-smi polling
+  - sample outputs captured so we can check the backends agree on content
 
-Backends are run as subprocesses; each writes a JSON metrics file we collect.
-SGLang is included only if --sglang is passed (and installed).
+Then prints a table and an output-agreement check.
+
+    python compare.py --requests 24 --trials 3
+
+Caveats it is honest about:
+  * vLLM peak VRAM is a *reservation* (gpu_memory_utilization), not a measured
+    requirement, so the memory column is reported but not used to rank backends.
+  * omniserve has no paged attention / fused kernels / chunked prefill; the gap
+    to vLLM is the expected cost of those.
 """
 
 from __future__ import annotations
@@ -12,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import statistics
 import subprocess
 import sys
 import threading
@@ -32,11 +43,8 @@ def _gpu_used_mib() -> float:
 
 
 def run(script: str, extra: list, out: str):
-    """Run a backend in a subprocess; poll nvidia-smi to capture true peak VRAM
-    (works uniformly even when the backend allocates in a child process)."""
     cmd = [PY, os.path.join(HERE, script), "--out", os.path.join(HERE, out)] + extra
-    print(f"\n>>> running {script} {' '.join(extra)}")
-
+    print(f"\n>>> {script} {' '.join(extra)}")
     baseline = _gpu_used_mib()
     peak = {"v": 0.0}
     stop = threading.Event()
@@ -51,54 +59,98 @@ def run(script: str, extra: list, out: str):
     r = subprocess.run(cmd, cwd=HERE, env=ENV)
     stop.set()
     th.join()
-
     if r.returncode != 0:
         print(f"!!! {script} failed (exit {r.returncode})")
         return None
     with open(os.path.join(HERE, out)) as f:
         d = json.load(f)
-    # override torch-based peak with the externally measured GPU peak (above idle)
-    d["peak_mem_mib"] = round(peak["v"] - baseline)
+    d["peak_gpu_mib"] = round(peak["v"] - baseline)
     return d
+
+
+def agg(d):
+    tps = [t["tok_per_s"] for t in d["trials"]]
+    rps = [t["req_per_s"] for t in d["trials"]]
+    return {
+        "backend": d["backend"],
+        "tok_s_med": statistics.median(tps),
+        "tok_s_min": min(tps), "tok_s_max": max(tps),
+        "req_s_med": statistics.median(rps),
+        "peak_gpu_mib": d.get("peak_gpu_mib", 0),
+        "sample_text": d.get("sample_text"),
+    }
+
+
+def norm(s: str) -> str:
+    return " ".join((s or "").lower().split())
+
+
+def output_agreement(a, b):
+    """Fraction of sampled prompts where both backends' outputs agree, plus a
+    char-level prefix-overlap as a softer signal."""
+    if not a or not b:
+        return None
+    n = min(len(a), len(b))
+    exact = sum(norm(a[i]) == norm(b[i]) for i in range(n))
+    # average longest common prefix ratio
+    def lcp(x, y):
+        x, y = norm(x), norm(y)
+        m = 0
+        for cx, cy in zip(x, y):
+            if cx != cy:
+                break
+            m += 1
+        return m / max(1, max(len(x), len(y)))
+    prefix = sum(lcp(a[i], b[i]) for i in range(n)) / n
+    return exact, n, prefix
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--requests", type=int, default=32)
-    ap.add_argument("--reuse", type=float, default=0.0)
-    ap.add_argument("--sglang", action="store_true")
+    ap.add_argument("--requests", type=int, default=24)
+    ap.add_argument("--trials", type=int, default=3)
     args = ap.parse_args()
+    common = ["--requests", str(args.requests), "--trials", str(args.trials)]
 
-    common = ["--requests", str(args.requests), "--reuse", str(args.reuse)]
-    results = []
+    raw = {}
+    d = run("run_vllm.py", common, "vllm.json")
+    if d:
+        raw["vLLM"] = d
+    d = run("run_omniserve.py", common + ["--fp16"], "omniserve.json")
+    if d:
+        raw["omniserve"] = d
 
-    r = run("run_vllm.py", common, "vllm.json")
-    if r:
-        results.append(r)
-    # omniserve in fp16 to match vLLM precision
-    r = run("run_omniserve.py", common + ["--fp16"], "omniserve.json")
-    if r:
-        results.append(r)
-    if args.sglang:
-        r = run("run_sglang.py", common, "sglang.json")
-        if r:
-            results.append(r)
+    results = [agg(d) for d in raw.values()]
 
-    print("\n" + "=" * 72)
-    print(f"Qwen2-VL-2B, {args.requests} requests, reuse={args.reuse}, RTX 4060 8GB")
-    print("=" * 72)
-    hdr = f"{'backend':<14}{'req/s':>9}{'tok/s':>9}{'wall(s)':>9}{'peak MiB':>10}"
-    print(hdr)
-    print("-" * 72)
+    print("\n" + "=" * 74)
+    print(f"Qwen2-VL-2B fp16 | {args.requests} concurrent reqs | {args.trials} trials "
+          f"(median) | RTX 4060 8GB")
+    print("=" * 74)
+    print(f"{'backend':<14}{'tok/s (med)':>14}{'[min-max]':>16}{'req/s':>9}{'peak GPU MiB*':>15}")
+    print("-" * 74)
     for r in results:
-        print(f"{r['backend']:<14}{r['req_per_s']:>9.3f}{r['tok_per_s']:>9.1f}"
-              f"{r['wall_s']:>9.1f}{r['peak_mem_mib']:>10.0f}")
-    if results:
-        fastest = max(results, key=lambda x: x["tok_per_s"])
-        print("-" * 72)
-        for r in results:
-            rel = r["tok_per_s"] / fastest["tok_per_s"] if fastest["tok_per_s"] else 0
-            print(f"{r['backend']:<14} {rel:.2f}x of {fastest['backend']} tok/s")
+        rng = f"[{r['tok_s_min']:.0f}-{r['tok_s_max']:.0f}]"
+        print(f"{r['backend']:<14}{r['tok_s_med']:>14.1f}{rng:>16}"
+              f"{r['req_s_med']:>9.2f}{r['peak_gpu_mib']:>15}")
+    if len(results) == 2:
+        a, b = results
+        rel = b["tok_s_med"] / a["tok_s_med"] if a["tok_s_med"] else 0
+        print("-" * 74)
+        print(f"{b['backend']} is {rel:.2f}x of {a['backend']} throughput "
+              f"({1/rel:.1f}x slower)" if rel else "")
+
+    print("\n* peak GPU MiB: for vLLM this is largely a pre-reservation "
+          "(gpu_memory_utilization),\n  not a measured requirement — reported, "
+          "not used to rank.")
+
+    if "vLLM" in raw and "omniserve" in raw:
+        oa = output_agreement(raw["vLLM"]["sample_text"], raw["omniserve"]["sample_text"])
+        if oa:
+            exact, n, prefix = oa
+            print(f"\noutput agreement on {n} sampled prompts: "
+                  f"{exact}/{n} exact match, {prefix:.0%} avg prefix overlap")
+            print("  (greedy + same weights => should be near-identical; small "
+                  "diffs come from kernel/quant numerics)")
 
 
 if __name__ == "__main__":

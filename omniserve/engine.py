@@ -30,13 +30,21 @@ class LLMEngine:
         self.runner = runner
         self.scheduler = Scheduler(sched_config or SchedulerConfig())
         self._seqs: Dict[str, Sequence] = {}
+        # retains every sequence ever submitted (finished ones are pruned from
+        # _seqs); handy for end-of-run metrics.
+        self._history: Dict[str, Sequence] = {}
 
     def add_request(self, request: Request) -> str:
         seq = Sequence(request=request)
         self.runner.tokenize(seq)
         self._seqs[seq.request_id] = seq
+        self._history[seq.request_id] = seq
         self.scheduler.add(seq)
         return seq.request_id
+
+    def sequences(self):
+        """All sequences submitted to this engine (running + finished)."""
+        return list(self._history.values())
 
     def abort(self, request_id: str) -> None:
         self.scheduler.abort(request_id)

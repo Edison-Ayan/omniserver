@@ -101,7 +101,7 @@ class QwenVLRunner(ModelRunner):
             next_id = self._sample(out.logits[:, -1, :], seq)
             seq.kv_handle = {
                 "cache": cache,
-                "rope_deltas": self.model.model.rope_deltas,
+                "rope_delta": int(self.model.model.rope_deltas.flatten()[0].item()),
                 "len": L,
             }
             seq.append_token(next_id)
@@ -109,20 +109,57 @@ class QwenVLRunner(ModelRunner):
 
     @torch.inference_mode()
     def decode(self, seqs: List[Sequence]) -> None:
-        for seq in seqs:
-            h = seq.kv_handle
-            # restore this sequence's rope state (shared model attr)
-            self.model.model.rope_deltas = h["rope_deltas"]
-            last = torch.tensor([[seq.last_token_id()]], device=self.device)
-            out = self.model(
-                input_ids=last,
-                past_key_values=h["cache"],
-                use_cache=True,
-                cache_position=torch.tensor([h["len"]], device=self.device),
-            )
-            h["len"] += 1
-            next_id = self._sample(out.logits[:, -1, :], seq)
-            seq.append_token(next_id)
+        """Advance all running sequences by one token in a SINGLE batched
+        forward pass. Sequences have different KV lengths, so we left-pad each
+        cache to the batch max and pass explicit M-RoPE positions + an
+        attention mask. Verified token-identical to per-sequence decoding."""
+        from transformers import DynamicCache
+
+        B = len(seqs)
+        device = self.device
+        lens = [s.kv_handle["len"] for s in seqs]
+        max_len = max(lens)
+
+        # 1) build a batched, left-padded KV cache from each sequence's cache
+        legs = [s.kv_handle["cache"].to_legacy_cache() for s in seqs]
+        n_layers = len(legs[0])
+        batched = []
+        for li in range(n_layers):
+            ks, vs = [], []
+            for b in range(B):
+                k, v = legs[b][li]
+                pad = max_len - k.shape[2]
+                if pad:
+                    k = torch.nn.functional.pad(k, (0, 0, pad, 0))
+                    v = torch.nn.functional.pad(v, (0, 0, pad, 0))
+                ks.append(k)
+                vs.append(v)
+            batched.append((torch.cat(ks, 0), torch.cat(vs, 0)))
+        bcache = DynamicCache.from_legacy_cache(batched)
+
+        # 2) batched inputs: last token, mask (left-padding), explicit positions
+        input_ids = torch.tensor([[s.last_token_id()] for s in seqs], device=device)
+        attn = torch.zeros(B, max_len + 1, device=device, dtype=torch.long)
+        pos = torch.empty(3, B, 1, device=device, dtype=torch.long)
+        for b in range(B):
+            attn[b, max_len - lens[b]:] = 1
+            pos[:, b, 0] = lens[b] + seqs[b].kv_handle["rope_delta"]
+
+        out = self.model(input_ids=input_ids, past_key_values=bcache, use_cache=True,
+                         attention_mask=attn, position_ids=pos,
+                         cache_position=torch.tensor([max_len], device=device))
+        logits = out.logits[:, -1, :]  # [B, vocab]
+
+        # 3) scatter updated KV back into each sequence's own cache; sample
+        new_legs = bcache.to_legacy_cache()
+        for b, seq in enumerate(seqs):
+            real = lens[b] + 1
+            per = [(k[b:b+1, :, max_len + 1 - real:, :].contiguous(),
+                    v[b:b+1, :, max_len + 1 - real:, :].contiguous())
+                   for (k, v) in new_legs]
+            seq.kv_handle["cache"] = DynamicCache.from_legacy_cache(per)
+            seq.kv_handle["len"] += 1
+            seq.append_token(self._sample(logits[b:b+1], seq))
             seq.maybe_finish()
 
     def detokenize(self, seq: Sequence, new_token_ids: List[int]) -> str:

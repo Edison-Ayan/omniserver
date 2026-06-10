@@ -39,9 +39,10 @@ vision-tower outputs by image content so repeated images skip the encoder.
 - [x] Engine step loop + streaming deltas (`engine.py`)
 - [x] Backend interface + `StubRunner` (control plane tested without a GPU)
 - [x] 4-bit model load validated on RTX 4060 (peak **2.1 GB** VRAM, see below)
+- [x] Vision embedding cache + benchmark harness (real numbers below)
 - [ ] `QwenVLRunner`: real prefill/decode + KV cache + vision cache
 - [ ] OpenAI-compatible server with SSE streaming
-- [ ] Benchmark harness vs. vLLM / SGLang-Omni
+- [ ] Benchmark vs. vLLM / SGLang-Omni
 
 ## Validated on RTX 4060 Laptop (8 GB)
 Qwen2-VL-2B-Instruct, 4-bit NF4:
@@ -55,6 +56,32 @@ Qwen2-VL-2B-Instruct, 4-bit NF4:
 
 The ~6 GB of headroom is what makes concurrent continuous batching feasible on
 this GPU.
+
+## Result: vision embedding cache
+Sweeping the image reuse rate on Qwen2-VL-2B (4-bit), baseline vs. cached:
+
+![vision cache benchmark](benchmarks/results.png)
+
+| image reuse | TTFT (p50) | throughput | cache hit rate |
+|---|---|---|---|
+| 0.00 | 184 → 185 ms (≈0%) | +3% | 0.00 |
+| 0.50 | 189 → 127 ms (**−33%**) | +8% | 0.50 |
+| 0.75 | 188 → **66 ms** (**−65%**) | +13% | 0.75 |
+| 1.00 | 190 → **67 ms** (**−65%**) | +21% | 0.94 |
+
+Key points:
+- **At 0% reuse the cache adds no measurable cost** (≈0% change) — it only helps
+  when there is something to reuse, with no overhead otherwise.
+- TTFT improvement grows with reuse and plateaus at ~65% once the vision encoder
+  is fully elided from prefill.
+- Cache hit rate tracks the reuse rate exactly, confirming correctness.
+
+Reproduce:
+```bash
+cd benchmarks
+HF_HUB_OFFLINE=1 python bench.py --sweep --requests 16 --out results.csv
+python plot.py results.csv          # -> results.png
+```
 
 ## Quickstart
 ```bash

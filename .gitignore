@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# venv
+.venv/
+venv/
+
+# benchmark / run artifacts
+*.csv
+*.png
+results/
+*.nsys-rep
+*.sqlite
+
+# model weights / caches (never commit — pulled from HF hub)
+*.safetensors
+*.bin
+models/
+.cache/
+
+# editor / OS
+.vscode/
+.idea/
+.DS_Store

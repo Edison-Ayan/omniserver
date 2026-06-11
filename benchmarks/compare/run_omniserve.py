@@ -47,16 +47,20 @@ def main():
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--vision-cache", action="store_true")
+    ap.add_argument("--prefix-cache", action="store_true")
     ap.add_argument("--max-running", type=int, default=32)
     ap.add_argument("--out", type=str, default="omniserve.json")
     args = ap.parse_args()
 
-    vc = None
+    vc = pc = None
     if args.vision_cache:
         from omniserve.cache import VisionEmbeddingCache
         vc = VisionEmbeddingCache(max_entries=args.requests)
+    if args.prefix_cache:
+        from omniserve.cache import PrefixKVCache
+        pc = PrefixKVCache(max_entries=args.requests)
 
-    runner = QwenVLRunner(load_in_4bit=not args.fp16, vision_cache=vc)
+    runner = QwenVLRunner(load_in_4bit=not args.fp16, vision_cache=vc, prefix_cache=pc)
     reqs = build(args.requests, reuse_rate=args.reuse)
 
     run_once(runner, reqs, args.max_running)  # warmup (not timed)
@@ -71,7 +75,7 @@ def main():
             sample_text = texts
 
     peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
-    tag = "omniserve" + ("+vc" if args.vision_cache else "")
+    tag = "omniserve" + ("+vc" if args.vision_cache else "") + ("+pc" if args.prefix_cache else "")
     result = {
         "backend": tag, "n_requests": args.requests, "trials": trials,
         "peak_mem_mib_torch": round(peak), "sample_text": sample_text,

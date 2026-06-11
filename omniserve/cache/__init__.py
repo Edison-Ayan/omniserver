@@ -4,6 +4,7 @@
 Future content-addressed / prefix reuse lives here too.
 """
 
+from .prefix import PrefixEntry, PrefixKVCache
 from .vision import CacheStats, VisionEmbeddingCache
 
-__all__ = ["VisionEmbeddingCache", "CacheStats"]
+__all__ = ["VisionEmbeddingCache", "CacheStats", "PrefixKVCache", "PrefixEntry"]

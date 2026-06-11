@@ -33,7 +33,7 @@ MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 
 class QwenVLRunner(ModelRunner):
     def __init__(self, model_id: str = MODEL_ID, load_in_4bit: bool = True,
-                 vision_cache=None):
+                 vision_cache=None, prefix_cache=None):
         from transformers import AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -43,8 +43,10 @@ class QwenVLRunner(ModelRunner):
         self.eos_ids = {self.model.config.eos_token_id}
         # per-request stash for prompt-stage tensors (pixel_values etc.)
         self._pending: Dict[str, dict] = {}
-        # per-request precomputed image content keys (for the vision cache)
+        # per-request precomputed image content keys (for the caches)
         self._img_keys: Dict[str, list] = {}
+        # optional prefix KV cache (reuse the whole prefill for repeated prefixes)
+        self.prefix_cache = prefix_cache
         # optional vision embedding cache (installed on the model)
         self.vision_cache = vision_cache
         if vision_cache is not None:
@@ -79,11 +81,12 @@ class QwenVLRunner(ModelRunner):
         seq.prompt_token_ids = inputs["input_ids"][0].tolist()
         self._pending[seq.request_id] = inputs
 
-        # content-address the images once, here, so the vision cache lookup is
-        # O(1) at the ViT instead of re-hashing the pixel tensor each call.
-        if self.vision_cache is not None and req.images:
+        # content-address the images once, here: used by the vision cache (O(1)
+        # ViT lookup) and the prefix cache (part of the prefix key).
+        if (self.vision_cache is not None or self.prefix_cache is not None) and req.images:
+            from ..cache.vision import VisionEmbeddingCache
             self._img_keys[seq.request_id] = [
-                self.vision_cache.image_key(im) for im in req.images]
+                VisionEmbeddingCache.image_key(im) for im in req.images]
 
         # make sure per-sequence stop ids include EOS
         sp = seq.request.sampling
@@ -91,17 +94,39 @@ class QwenVLRunner(ModelRunner):
             if e is not None and e not in sp.stop_token_ids:
                 sp.stop_token_ids.append(e)
 
+    @staticmethod
+    def _clone_cache(cache):
+        """Deep-copy a DynamicCache so two sequences can grow it independently."""
+        from transformers import DynamicCache
+        legacy = [(k.clone(), v.clone()) for (k, v) in cache.to_legacy_cache()]
+        return DynamicCache.from_legacy_cache(legacy)
+
     @torch.inference_mode()
     def prefill(self, seqs: List[Sequence]) -> None:
         from transformers import DynamicCache
 
         for seq in seqs:
             inputs = self._pending.pop(seq.request_id)
-            cache = DynamicCache()
+            img_keys = self._img_keys.pop(seq.request_id, None)
             L = inputs["input_ids"].shape[1]
+
+            # Prefix KV cache: identical (prompt tokens + images) -> reuse the
+            # whole prefill. A hit clones the cached KV and skips the forward.
+            pkey = None
+            if self.prefix_cache is not None:
+                pkey = self.prefix_cache.prefix_key(seq.prompt_token_ids, img_keys)
+                entry = self.prefix_cache.get(pkey, self._clone_cache)
+                if entry is not None:
+                    seq.kv_handle = {"cache": entry.cache,
+                                     "rope_delta": entry.rope_delta, "len": entry.length}
+                    seq.append_token(entry.first_token)
+                    seq.maybe_finish()
+                    continue
+
+            cache = DynamicCache()
             self.model.model.rope_deltas = None  # force recompute for this seq
             if self.vision_cache is not None:
-                self.vision_cache.set_pending(self._img_keys.pop(seq.request_id, None))
+                self.vision_cache.set_pending(img_keys)
             out = self.model(
                 **inputs,
                 past_key_values=cache,
@@ -111,12 +136,16 @@ class QwenVLRunner(ModelRunner):
             if self.vision_cache is not None:
                 self.vision_cache.set_pending(None)
             next_id = self._sample(out.logits[:, -1, :], seq)
-            seq.kv_handle = {
-                "cache": cache,
-                "rope_delta": int(self.model.model.rope_deltas.flatten()[0].item()),
-                "len": L,
-            }
+            rope_delta = int(self.model.model.rope_deltas.flatten()[0].item())
+            seq.kv_handle = {"cache": cache, "rope_delta": rope_delta, "len": L}
             seq.append_token(next_id)
+
+            # Store a clone so the cached prefix stays pristine as this seq decodes.
+            if self.prefix_cache is not None:
+                from ..cache.prefix import PrefixEntry
+                self.prefix_cache.put(pkey, PrefixEntry(
+                    cache=self._clone_cache(cache), rope_delta=rope_delta,
+                    length=L, first_token=next_id))
             seq.maybe_finish()
 
     @torch.inference_mode()

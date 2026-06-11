@@ -15,6 +15,7 @@ venv/
 results/
 *.nsys-rep
 *.sqlite
+benchmarks/compare/*.json
 
 # model weights / caches (never commit — pulled from HF hub)
 *.safetensors

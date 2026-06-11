@@ -136,6 +136,17 @@ python scripts/check_model.py
 ```
 
 ## Layout
-- `omniserve/` — the engine package (scheduler, engine, runner, data model)
-- `scripts/` — standalone checks (e.g. `check_model.py`)
-- `benchmarks/` — workload + benchmark harness (WIP)
+```
+omniserve/
+├── omniserve/              # the engine package
+│   ├── request.py          # Request / Sequence / SamplingParams data model
+│   ├── scheduler.py        # continuous-batching scheduler
+│   ├── engine.py           # step loop (schedule → prefill → decode → retire)
+│   ├── runners/            # model execution backends
+│   │   ├── base.py         # ModelRunner interface + StubRunner (no-GPU)
+│   │   └── qwen_vl.py      # QwenVLRunner: real Qwen2-VL + KV cache + batched decode
+│   └── cache/              # multimodal caching components
+│       └── vision.py       # vision-embedding cache (skip the ViT for repeated images)
+├── benchmarks/             # vision-cache benchmark, profiler, and compare/ (vs vLLM)
+└── scripts/                # standalone checks (check_model.py, batched-decode proto)
+```

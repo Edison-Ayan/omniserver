@@ -24,7 +24,7 @@ from __future__ import annotations
 import abc
 from typing import List
 
-from .request import Sequence
+from ..request import Sequence
 
 
 class ModelRunner(abc.ABC):

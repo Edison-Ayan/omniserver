@@ -9,7 +9,7 @@ import torch
 from PIL import Image, ImageDraw
 from transformers import DynamicCache
 
-from omniserve.qwen_runner import QwenVLRunner
+from omniserve.runners.qwen_vl import QwenVLRunner
 
 
 def img(c):

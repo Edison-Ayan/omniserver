@@ -15,15 +15,20 @@ from __future__ import annotations
 import argparse
 import csv
 import statistics
+import sys
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root for `omniserve`
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import List, Optional
 
 import torch
 
-from vision_cache import VisionEmbeddingCache
 from workload import Request, build_workload
+
+from omniserve.cache import VisionEmbeddingCache
 
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 

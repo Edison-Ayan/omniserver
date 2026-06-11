@@ -5,8 +5,8 @@ Public surface kept small on purpose; the interesting parts are the scheduler
 """
 
 from .engine import LLMEngine, StepDelta
-from .model_runner import ModelRunner, StubRunner
 from .request import Request, SamplingParams, Sequence, Status
+from .runners import ModelRunner, StubRunner
 from .scheduler import Scheduler, SchedulerConfig
 
 __all__ = [
@@ -26,6 +26,6 @@ __all__ = [
 def __getattr__(name):
     # Lazy import so the control plane stays importable without torch/transformers.
     if name == "QwenVLRunner":
-        from .qwen_runner import QwenVLRunner
+        from .runners.qwen_vl import QwenVLRunner
         return QwenVLRunner
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

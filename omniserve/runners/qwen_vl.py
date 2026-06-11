@@ -25,8 +25,8 @@ from typing import Dict, List, Optional
 
 import torch
 
-from .model_runner import ModelRunner
-from .request import Sequence
+from .base import ModelRunner
+from ..request import Sequence
 
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 
@@ -150,16 +150,19 @@ class QwenVLRunner(ModelRunner):
                          cache_position=torch.tensor([max_len], device=device))
         logits = out.logits[:, -1, :]  # [B, vocab]
 
-        # 3) scatter updated KV back into each sequence's own cache; sample
+        # 3) append ONLY the new token's KV to each sequence's own cache.
+        #    The old KV is unchanged, so we copy a single position per layer
+        #    instead of rebuilding the whole per-sequence cache (the new token
+        #    sits at index max_len in the batched cache after the forward).
         new_legs = bcache.to_legacy_cache()
         for b, seq in enumerate(seqs):
-            real = lens[b] + 1
-            per = [(k[b:b+1, :, max_len + 1 - real:, :].contiguous(),
-                    v[b:b+1, :, max_len + 1 - real:, :].contiguous())
-                   for (k, v) in new_legs]
-            seq.kv_handle["cache"] = DynamicCache.from_legacy_cache(per)
+            cache = seq.kv_handle["cache"]
+            for li, (k, v) in enumerate(new_legs):
+                k_new = k[b:b + 1, :, max_len:max_len + 1, :].contiguous()
+                v_new = v[b:b + 1, :, max_len:max_len + 1, :].contiguous()
+                cache.update(k_new, v_new, li)
             seq.kv_handle["len"] += 1
-            seq.append_token(self._sample(logits[b:b+1], seq))
+            seq.append_token(self._sample(logits[b:b + 1], seq))
             seq.maybe_finish()
 
     def detokenize(self, seq: Sequence, new_token_ids: List[int]) -> str:

@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from _workload import MAX_NEW_TOKENS, PROMPT, build, make_image  # noqa: E402
 
 from omniserve import LLMEngine, Request, SamplingParams, SchedulerConfig  # noqa: E402
-from omniserve.qwen_runner import QwenVLRunner  # noqa: E402
+from omniserve.runners.qwen_vl import QwenVLRunner  # noqa: E402
 
 
 def run_once(runner, reqs, max_running):
@@ -53,8 +53,7 @@ def main():
 
     vc = None
     if args.vision_cache:
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-        from vision_cache import VisionEmbeddingCache  # type: ignore
+        from omniserve.cache import VisionEmbeddingCache
         vc = VisionEmbeddingCache(max_entries=args.requests)
 
     runner = QwenVLRunner(load_in_4bit=not args.fp16, vision_cache=vc)

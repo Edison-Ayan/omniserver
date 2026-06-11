@@ -12,7 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List
 
-from .model_runner import ModelRunner
+from .runners.base import ModelRunner
 from .request import Request, Sequence, Status
 from .scheduler import Scheduler, SchedulerConfig
 

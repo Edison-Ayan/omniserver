@@ -45,6 +45,9 @@ vision-tower outputs by image content so repeated images skip the encoder.
 - [x] Batched decode: all sequences advance in one forward pass (left-padded KV
       + explicit M-RoPE positions) — token-identical to sequential, **~3x
       throughput** (see below)
+- [x] **Preallocated KV pool**: write the new token in place instead of the
+      O(L²) cat-based rebuild — kernels/step **15.2k → 3.1k**, **+15%** decode
+      (token-identical), and the static shapes a CUDA graph needs
 - [x] Rigorous benchmark vs. vLLM (matched fp16, CUDA graphs, median of 3 trials,
       verified-identical outputs) — omniserve reaches **0.34x** of vLLM
 - [x] Content-addressed **vision embedding cache** wired into the engine
@@ -52,6 +55,8 @@ vision-tower outputs by image content so repeated images skip the encoder.
       token-identical, **1.84x** throughput on reuse-heavy traffic (see below)
 - [x] **Fused Triton RMSNorm** kernel for the LLM stack (1.8–8.5x vs HF in
       isolation, token-identical, ~1% end-to-end — Amdahl)
+- [ ] CUDA-graph capture of the decode step (collapse the remaining ~3.1k
+      per-layer kernel launches now that shapes are static)
 - [ ] Batched/chunked prefill
 - [x] OpenAI-compatible server (`/v1/chat/completions`, vision input + SSE
       streaming) on top of the continuous-batching engine

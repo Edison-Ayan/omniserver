@@ -45,6 +45,10 @@ class ModelRunner(abc.ABC):
     def detokenize(self, seq: Sequence, new_token_ids: List[int]) -> str:
         """Render newly produced token ids to text for streaming."""
 
+    def free(self, seq: Sequence) -> None:
+        """Release any resources (e.g. a KV-cache slot) held by a finished
+        sequence. Default no-op; backends with a preallocated pool override it."""
+
 
 class StubRunner(ModelRunner):
     """No-GPU runner that lets us exercise the scheduler/engine end to end.

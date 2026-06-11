@@ -69,9 +69,10 @@ class LLMEngine:
                 seq.num_streamed = seq.num_output_tokens
                 deltas.append(StepDelta(seq.request_id, text, seq.status != Status.RUNNING))
 
-        # Release finished sequences (KV cache freeing happens in the runner via
-        # the kv_handle going out of scope / explicit free hook later).
+        # Release finished sequences: tell the runner to free their KV slot
+        # (it compacts its preallocated pool), then drop them from the registry.
         for seq in self.scheduler.free_finished():
+            self.runner.free(seq)
             self._seqs.pop(seq.request_id, None)
 
         return deltas

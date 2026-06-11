@@ -33,7 +33,8 @@ MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 
 class QwenVLRunner(ModelRunner):
     def __init__(self, model_id: str = MODEL_ID, load_in_4bit: bool = True,
-                 vision_cache=None, prefix_cache=None, fused_kernels: bool = False):
+                 vision_cache=None, prefix_cache=None, fused_kernels: bool = False,
+                 prealloc_kv: bool = True, max_running: int = 32, max_len: int = 1024):
         from transformers import AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(model_id)
@@ -54,6 +55,22 @@ class QwenVLRunner(ModelRunner):
         self.vision_cache = vision_cache
         if vision_cache is not None:
             vision_cache.install(self.model)
+
+        # Preallocated KV pool: write the new token in place instead of the
+        # O(L^2) cat-based DynamicCache rebuild each decode step. Slots [0,n) hold
+        # the active sequences; finishing a sequence compacts the pool.
+        self.prealloc_kv = prealloc_kv
+        self._max_len = max_len
+        self._pool = None
+        self._slot_seq: List = []   # _slot_seq[slot] -> Sequence in that slot
+        if prealloc_kv:
+            cfg = self.model.config
+            from ..cache.kv_prealloc import PreallocatedKVCache
+            self._pool = PreallocatedKVCache(
+                n_layers=cfg.num_hidden_layers, max_batch=max_running,
+                n_kv_heads=cfg.num_key_value_heads, max_len=max_len,
+                head_dim=cfg.hidden_size // cfg.num_attention_heads,
+                device=self.device, dtype=torch.float16)
 
     @staticmethod
     def _load(model_id: str, load_in_4bit: bool):
@@ -104,6 +121,17 @@ class QwenVLRunner(ModelRunner):
         legacy = [(k.clone(), v.clone()) for (k, v) in cache.to_legacy_cache()]
         return DynamicCache.from_legacy_cache(legacy)
 
+    def _store_prefill(self, seq, cache, length: int, rope_delta: int) -> None:
+        """Park a sequence's prefill KV: into a pool slot (prealloc) or keep the
+        per-sequence DynamicCache (legacy path)."""
+        if self.prealloc_kv:
+            slot = len(self._slot_seq)
+            self._pool.set_slot_prefix(slot, cache.to_legacy_cache(), length)
+            self._slot_seq.append(seq)
+            seq.kv_handle = {"slot": slot, "rope_delta": rope_delta}
+        else:
+            seq.kv_handle = {"cache": cache, "rope_delta": rope_delta, "len": length}
+
     @torch.inference_mode()
     def prefill(self, seqs: List[Sequence]) -> None:
         from transformers import DynamicCache
@@ -120,8 +148,7 @@ class QwenVLRunner(ModelRunner):
                 pkey = self.prefix_cache.prefix_key(seq.prompt_token_ids, img_keys)
                 entry = self.prefix_cache.get(pkey, self._clone_cache)
                 if entry is not None:
-                    seq.kv_handle = {"cache": entry.cache,
-                                     "rope_delta": entry.rope_delta, "len": entry.length}
+                    self._store_prefill(seq, entry.cache, entry.length, entry.rope_delta)
                     seq.append_token(entry.first_token)
                     seq.maybe_finish()
                     continue
@@ -140,23 +167,77 @@ class QwenVLRunner(ModelRunner):
                 self.vision_cache.set_pending(None)
             next_id = self._sample(out.logits[:, -1, :], seq)
             rope_delta = int(self.model.model.rope_deltas.flatten()[0].item())
-            seq.kv_handle = {"cache": cache, "rope_delta": rope_delta, "len": L}
-            seq.append_token(next_id)
 
-            # Store a clone so the cached prefix stays pristine as this seq decodes.
+            # Store a clone for the prefix cache BEFORE the pool consumes `cache`
+            # (set_slot_prefix only reads it, but cloning keeps the cached copy
+            # independent of any later in-place writes).
             if self.prefix_cache is not None:
                 from ..cache.prefix import PrefixEntry
                 self.prefix_cache.put(pkey, PrefixEntry(
                     cache=self._clone_cache(cache), rope_delta=rope_delta,
                     length=L, first_token=next_id))
+
+            self._store_prefill(seq, cache, L, rope_delta)
+            seq.append_token(next_id)
             seq.maybe_finish()
 
-    @torch.inference_mode()
     def decode(self, seqs: List[Sequence]) -> None:
-        """Advance all running sequences by one token in a SINGLE batched
-        forward pass. Sequences have different KV lengths, so we left-pad each
-        cache to the batch max and pass explicit M-RoPE positions + an
-        attention mask. Verified token-identical to per-sequence decoding."""
+        if self.prealloc_kv:
+            return self._decode_prealloc(seqs)
+        return self._decode_cat(seqs)
+
+    @torch.inference_mode()
+    def _decode_prealloc(self, seqs: List[Sequence]) -> None:
+        """Advance all running sequences one token in a single forward, writing
+        each new token's KV in place into the preallocated pool (no per-step
+        rebuild). Active sequences occupy contiguous slots [0, n); we order the
+        batch by slot so row b == slot b."""
+        seqs = sorted(seqs, key=lambda s: s.kv_handle["slot"])
+        n = len(seqs)
+        assert all(seqs[b].kv_handle["slot"] == b for b in range(n)), \
+            "decode slots must be the contiguous prefix [0, n)"
+        device = self.device
+
+        view = self._pool.view(n)
+        wpos = view.write_pos              # [n] per-slot position of the new token
+        ret = view.ret_len
+        input_ids = torch.tensor([[s.last_token_id()] for s in seqs], device=device)
+        rope = torch.tensor([s.kv_handle["rope_delta"] for s in seqs], device=device)
+        attn = torch.zeros(n, ret, device=device, dtype=torch.long)
+        for b in range(n):
+            attn[b, : wpos[b] + 1] = 1     # new token attends to [0, wpos]
+        pos = torch.empty(3, n, 1, device=device, dtype=torch.long)
+        pos[:, :, 0] = (wpos + rope).unsqueeze(0)
+
+        out = self.model(input_ids=input_ids, past_key_values=view, use_cache=True,
+                         attention_mask=attn, position_ids=pos,
+                         cache_position=torch.tensor([ret - 1], device=device))
+        logits = out.logits[:, -1, :]
+        for b, seq in enumerate(seqs):
+            seq.append_token(self._sample(logits[b:b + 1], seq))
+            seq.maybe_finish()
+
+    def free(self, seq: Sequence) -> None:
+        """Release a finished sequence's pool slot, compacting so active slots
+        stay the contiguous prefix [0, n): move the last active sequence into the
+        freed slot."""
+        if not self.prealloc_kv:
+            return
+        slot = seq.kv_handle.get("slot")
+        if slot is None:
+            return
+        last = len(self._slot_seq) - 1
+        if slot != last:
+            self._pool.move_slot(last, slot)
+            moved = self._slot_seq[last]
+            moved.kv_handle["slot"] = slot
+            self._slot_seq[slot] = moved
+        self._slot_seq.pop()
+
+    @torch.inference_mode()
+    def _decode_cat(self, seqs: List[Sequence]) -> None:
+        """Legacy path: rebuild a left-padded batched DynamicCache each step
+        (O(L^2) cat). Kept for A/B comparison against the preallocated pool."""
         from transformers import DynamicCache
 
         B = len(seqs)

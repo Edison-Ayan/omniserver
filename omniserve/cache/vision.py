@@ -107,6 +107,12 @@ class VisionEmbeddingCache:
         visual.forward = cached_forward
         return self
 
+    def clear(self) -> None:
+        """Drop cached embeddings and reset stats (for cold-start benchmarking).
+        Keeps the monkeypatch installed."""
+        self._store.clear()
+        self.stats = CacheStats()
+
     def uninstall(self):
         if self._visual is not None and self._orig_forward is not None:
             self._visual.forward = self._orig_forward

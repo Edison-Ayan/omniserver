@@ -63,22 +63,35 @@ def main():
     runner = QwenVLRunner(load_in_4bit=not args.fp16, vision_cache=vc, prefix_cache=pc)
     reqs = build(args.requests, reuse_rate=args.reuse)
 
+    def reset_caches():
+        # cold-start each timed run so the cache only exploits within-stream reuse
+        # (otherwise warmup primes it and the reuse rate becomes irrelevant).
+        if vc is not None:
+            vc.clear()
+        if pc is not None:
+            pc.clear()
+
     run_once(runner, reqs, args.max_running)  # warmup (not timed)
 
     torch.cuda.reset_peak_memory_stats()
-    trials, sample_text = [], None
+    trials, sample_text, hit_rate = [], None, None
     for _ in range(args.trials):
+        reset_caches()
         wall, toks, texts = run_once(runner, reqs, args.max_running)
         trials.append({"wall_s": wall, "tokens": toks,
                        "tok_per_s": toks / wall, "req_per_s": args.requests / wall})
         if sample_text is None:
             sample_text = texts
+        cache_obj = pc or vc
+        if cache_obj is not None:
+            hit_rate = cache_obj.stats.hit_rate
 
     peak = torch.cuda.max_memory_allocated() / (1024 ** 2)
     tag = "omniserve" + ("+vc" if args.vision_cache else "") + ("+pc" if args.prefix_cache else "")
     result = {
         "backend": tag, "n_requests": args.requests, "trials": trials,
         "peak_mem_mib_torch": round(peak), "sample_text": sample_text,
+        "hit_rate": hit_rate,
     }
     with open(args.out, "w") as f:
         json.dump(result, f, indent=2)

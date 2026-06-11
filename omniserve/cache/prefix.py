@@ -77,3 +77,8 @@ class PrefixKVCache:
         while len(self._store) > self.max_entries:
             self._store.popitem(last=False)
             self.stats.evictions += 1
+
+    def clear(self) -> None:
+        """Drop all entries and reset stats (for cold-start benchmarking)."""
+        self._store.clear()
+        self.stats = CacheStats()

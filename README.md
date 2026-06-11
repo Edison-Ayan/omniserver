@@ -50,6 +50,8 @@ vision-tower outputs by image content so repeated images skip the encoder.
 - [x] Content-addressed **vision embedding cache** wired into the engine
 - [x] **Prefix KV cache** (reuse the whole prefill for repeated prefixes) —
       token-identical, **1.84x** throughput on reuse-heavy traffic (see below)
+- [x] **Fused Triton RMSNorm** kernel for the LLM stack (1.8–8.5x vs HF in
+      isolation, token-identical, ~1% end-to-end — Amdahl)
 - [ ] Batched/chunked prefill
 - [ ] OpenAI-compatible server with SSE streaming
 
@@ -176,8 +178,11 @@ omniserve/
 │   ├── runners/            # model execution backends
 │   │   ├── base.py         # ModelRunner interface + StubRunner (no-GPU)
 │   │   └── qwen_vl.py      # QwenVLRunner: real Qwen2-VL + KV cache + batched decode
-│   └── cache/              # multimodal caching components
-│       └── vision.py       # vision-embedding cache (skip the ViT for repeated images)
+│   ├── cache/              # multimodal caching components
+│   │   ├── vision.py       # vision-embedding cache (skip the ViT for repeated images)
+│   │   └── prefix.py       # prefix KV cache (skip the whole prefill for repeated prefixes)
+│   └── kernels/            # hand-written fused kernels
+│       └── rmsnorm.py      # fused Triton RMSNorm for the LLM stack
 ├── benchmarks/             # vision-cache benchmark, profiler, and compare/ (vs vLLM)
 └── scripts/                # standalone checks (check_model.py, batched-decode proto)
 ```

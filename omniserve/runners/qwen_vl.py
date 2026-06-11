@@ -33,12 +33,15 @@ MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 
 class QwenVLRunner(ModelRunner):
     def __init__(self, model_id: str = MODEL_ID, load_in_4bit: bool = True,
-                 vision_cache=None, prefix_cache=None):
+                 vision_cache=None, prefix_cache=None, fused_kernels: bool = False):
         from transformers import AutoProcessor
 
         self.processor = AutoProcessor.from_pretrained(model_id)
         self.tokenizer = self.processor.tokenizer
         self.model = self._load(model_id, load_in_4bit)
+        if fused_kernels:
+            from ..kernels import patch_llm_rmsnorm
+            patch_llm_rmsnorm(self.model)
         self.device = next(self.model.parameters()).device
         self.eos_ids = {self.model.config.eos_token_id}
         # per-request stash for prompt-stage tensors (pixel_values etc.)

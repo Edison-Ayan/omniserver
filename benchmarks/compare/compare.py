@@ -132,12 +132,16 @@ def main():
         rng = f"[{r['tok_s_min']:.0f}-{r['tok_s_max']:.0f}]"
         print(f"{r['backend']:<14}{r['tok_s_med']:>14.1f}{rng:>16}"
               f"{r['req_s_med']:>9.2f}{r['peak_gpu_mib']:>15}")
-    if len(results) == 2:
-        a, b = results
-        rel = b["tok_s_med"] / a["tok_s_med"] if a["tok_s_med"] else 0
+    if len(results) >= 2:
+        fastest = max(results, key=lambda r: r["tok_s_med"])
         print("-" * 74)
-        print(f"{b['backend']} is {rel:.2f}x of {a['backend']} throughput "
-              f"({1/rel:.1f}x slower)" if rel else "")
+        for r in results:
+            if r is fastest:
+                continue
+            rel = r["tok_s_med"] / fastest["tok_s_med"] if fastest["tok_s_med"] else 0
+            if rel:
+                print(f"{r['backend']:<14} {rel:.2f}x of {fastest['backend']} "
+                      f"({1/rel:.1f}x slower)")
 
     print("\n* peak GPU MiB: for vLLM this is largely a pre-reservation "
           "(gpu_memory_utilization),\n  not a measured requirement — reported, "

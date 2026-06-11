@@ -1,4 +1,4 @@
-"""Shared workload + metrics for the omniserve vs vLLM vs SGLang comparison.
+"""Shared workload + metrics for the omniserve vs vLLM comparison.
 
 Every backend is fed the *identical* set of (image, prompt) requests and the
 same decoding settings, so differences in the reported numbers come from the

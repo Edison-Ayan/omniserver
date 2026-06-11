@@ -2,8 +2,7 @@
 
 A lightweight **multimodal LLM inference engine** with continuous batching and a
 vision-embedding cache, built to run a vision-language model (Qwen2-VL-2B) on a
-**single 8 GB consumer GPU** (RTX 4060 Laptop). Inspired by / benchmarked
-against SGLang-Omni and vLLM.
+**single 8 GB consumer GPU** (RTX 4060 Laptop). Benchmarked against vLLM.
 
 > Goal: demonstrate the core serving-engine techniques — iteration-level
 > scheduling, KV-cache management, and multimodal-specific optimizations — in a
@@ -50,12 +49,6 @@ vision-tower outputs by image content so repeated images skip the encoder.
       verified-identical outputs) — omniserve reaches **0.34x** of vLLM
 - [ ] Batched/chunked prefill
 - [ ] OpenAI-compatible server with SSE streaming
-- [~] SGLang in the comparison — *attempted, deferred on this box*: SGLang's
-      runtime JIT (flashinfer) needs a full CUDA toolkit, which doesn't fit the
-      constrained, no-toolkit laptop setup here. The comparison harness already
-      supports a third backend via `compare.py --sglang-python <path>`; the
-      `run_sglang.py` adapter is the only missing piece once a CUDA-toolkit env
-      is available. (A nice illustration of SGLang's heavier deployment surface.)
 
 ## Validated on RTX 4060 Laptop (8 GB)
 Qwen2-VL-2B-Instruct, 4-bit NF4:

@@ -43,6 +43,8 @@ class QwenVLRunner(ModelRunner):
         self.eos_ids = {self.model.config.eos_token_id}
         # per-request stash for prompt-stage tensors (pixel_values etc.)
         self._pending: Dict[str, dict] = {}
+        # per-request precomputed image content keys (for the vision cache)
+        self._img_keys: Dict[str, list] = {}
         # optional vision embedding cache (installed on the model)
         self.vision_cache = vision_cache
         if vision_cache is not None:
@@ -77,6 +79,12 @@ class QwenVLRunner(ModelRunner):
         seq.prompt_token_ids = inputs["input_ids"][0].tolist()
         self._pending[seq.request_id] = inputs
 
+        # content-address the images once, here, so the vision cache lookup is
+        # O(1) at the ViT instead of re-hashing the pixel tensor each call.
+        if self.vision_cache is not None and req.images:
+            self._img_keys[seq.request_id] = [
+                self.vision_cache.image_key(im) for im in req.images]
+
         # make sure per-sequence stop ids include EOS
         sp = seq.request.sampling
         for e in self.eos_ids:
@@ -92,12 +100,16 @@ class QwenVLRunner(ModelRunner):
             cache = DynamicCache()
             L = inputs["input_ids"].shape[1]
             self.model.model.rope_deltas = None  # force recompute for this seq
+            if self.vision_cache is not None:
+                self.vision_cache.set_pending(self._img_keys.pop(seq.request_id, None))
             out = self.model(
                 **inputs,
                 past_key_values=cache,
                 use_cache=True,
                 cache_position=torch.arange(L, device=self.device),
             )
+            if self.vision_cache is not None:
+                self.vision_cache.set_pending(None)
             next_id = self._sample(out.logits[:, -1, :], seq)
             seq.kv_handle = {
                 "cache": cache,

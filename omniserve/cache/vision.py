@@ -10,6 +10,13 @@ Hook point (verified against transformers 4.57, Qwen2-VL): the model calls
     self.visual(pixel_values, grid_thw=image_grid_thw) -> image_embeds
 where `model.visual` is the Qwen2VisionTransformerPretrainedModel. We monkeypatch
 its `forward`. An LRU bound keeps cache memory flat.
+
+Content addressing: the cache key is a hash of the *image content*. The runner
+computes it once when a request arrives (`image_key`) and hands it to the cache
+via `set_pending` before each prefill, so a cache lookup is O(1) instead of
+re-hashing the full pixel tensor on every ViT call. When no precomputed key is
+supplied (e.g. the standalone benchmark calling the model directly), it falls
+back to hashing the pixel tensor.
 """
 
 from __future__ import annotations
@@ -17,8 +24,10 @@ from __future__ import annotations
 import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
+from PIL import Image
 
 
 @dataclass
@@ -44,9 +53,20 @@ class VisionEmbeddingCache:
         self.stats = CacheStats()
         self._orig_forward = None
         self._visual = None
+        self._pending: Optional[List[str]] = None  # content keys for next forward
 
     @staticmethod
-    def _key(hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> str:
+    def image_key(image: Image.Image) -> str:
+        """Content hash of an image, computed once at request ingest."""
+        return hashlib.sha1(image.tobytes()).hexdigest()
+
+    def set_pending(self, keys: Optional[List[str]]) -> None:
+        """Supply the content keys for the images in the upcoming forward.
+        One key per image, in the order the processor laid them out."""
+        self._pending = keys
+
+    @staticmethod
+    def _pixel_key(hidden_states: torch.Tensor, grid_thw: torch.Tensor) -> str:
         h = hashlib.sha1()
         h.update(hidden_states.detach().to(torch.float16).cpu().numpy().tobytes())
         h.update(grid_thw.detach().cpu().numpy().tobytes())
@@ -58,10 +78,17 @@ class VisionEmbeddingCache:
         self._orig_forward = visual.forward
 
         def cached_forward(hidden_states, grid_thw, **kwargs):
-            try:
-                key = self._key(hidden_states, grid_thw)
-            except Exception:
-                return self._orig_forward(hidden_states, grid_thw, **kwargs)
+            # Use the precomputed content key only when it unambiguously maps to
+            # this call (a single image); otherwise hash the pixels as a fallback.
+            key = None
+            if self._pending is not None and len(self._pending) == 1 \
+                    and grid_thw is not None and grid_thw.shape[0] == 1:
+                key = self._pending[0]
+            if key is None:
+                try:
+                    key = self._pixel_key(hidden_states, grid_thw)
+                except Exception:
+                    return self._orig_forward(hidden_states, grid_thw, **kwargs)
 
             cached = self._store.get(key)
             if cached is not None:

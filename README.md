@@ -17,7 +17,7 @@ vision-tower outputs by image content so repeated images skip the encoder.
 
 ## Architecture
 ```
-  HTTP (OpenAI-compatible)            server.py        [planned]
+  HTTP (OpenAI-compatible)            server.py        ✓
         │
         ▼
   LLMEngine  ── step loop ──────────  engine.py        ✓
@@ -53,7 +53,8 @@ vision-tower outputs by image content so repeated images skip the encoder.
 - [x] **Fused Triton RMSNorm** kernel for the LLM stack (1.8–8.5x vs HF in
       isolation, token-identical, ~1% end-to-end — Amdahl)
 - [ ] Batched/chunked prefill
-- [ ] OpenAI-compatible server with SSE streaming
+- [x] OpenAI-compatible server (`/v1/chat/completions`, vision input + SSE
+      streaming) on top of the continuous-batching engine
 
 ## Validated on RTX 4060 Laptop (8 GB)
 Qwen2-VL-2B-Instruct, 4-bit NF4:
@@ -168,6 +169,21 @@ python -c "from omniserve import LLMEngine, Request, StubRunner; \
 python scripts/check_model.py
 ```
 
+## Serving (OpenAI-compatible)
+```bash
+python -m omniserve.server --port 8000 --prefix-cache   # add --fp16 for fp16
+```
+Then hit it like any OpenAI vision endpoint (base64 data-URI image):
+```bash
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,<...>"}},
+    {"type": "text", "text": "What is in this image?"}]}],
+  "max_tokens": 64, "stream": true }'
+```
+Streaming (`"stream": true`) returns SSE chunks; omitting it returns a single
+`chat.completion`. Concurrent requests are continuously batched by the engine.
+
 ## Layout
 ```
 omniserve/
@@ -181,8 +197,9 @@ omniserve/
 │   ├── cache/              # multimodal caching components
 │   │   ├── vision.py       # vision-embedding cache (skip the ViT for repeated images)
 │   │   └── prefix.py       # prefix KV cache (skip the whole prefill for repeated prefixes)
-│   └── kernels/            # hand-written fused kernels
-│       └── rmsnorm.py      # fused Triton RMSNorm for the LLM stack
+│   ├── kernels/            # hand-written fused kernels
+│   │   └── rmsnorm.py      # fused Triton RMSNorm for the LLM stack
+│   └── server.py           # OpenAI-compatible HTTP server (vision + SSE)
 ├── benchmarks/             # vision-cache benchmark, profiler, and compare/ (vs vLLM)
 └── scripts/                # standalone checks (check_model.py, batched-decode proto)
 ```

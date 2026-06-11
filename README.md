@@ -47,6 +47,9 @@ vision-tower outputs by image content so repeated images skip the encoder.
       throughput** (see below)
 - [x] Rigorous benchmark vs. vLLM (matched fp16, CUDA graphs, median of 3 trials,
       verified-identical outputs) — omniserve reaches **0.34x** of vLLM
+- [x] Content-addressed **vision embedding cache** wired into the engine
+- [x] **Prefix KV cache** (reuse the whole prefill for repeated prefixes) —
+      token-identical, **1.84x** throughput on reuse-heavy traffic (see below)
 - [ ] Batched/chunked prefill
 - [ ] OpenAI-compatible server with SSE streaming
 
@@ -99,7 +102,35 @@ buys you on this workload.
 
 Reproduce: `cd benchmarks/compare && python compare.py --requests 24 --trials 3`
 
-## Result: vision embedding cache
+## Result: caching for repeated multimodal content
+Multimodal traffic repeats images (multi-turn chat, repeated system images). Two
+ways to exploit that, measured in-engine at 24 concurrent requests, fp16, cold
+cache per trial (so the number reflects within-stream reuse, not a primed cache):
+
+| config | reuse 0.0 | reuse 0.9 (92% hit) | speedup from reuse |
+|---|---|---|---|
+| no cache | 176.9 | 178.5 tok/s | 1.01x |
+| + vision cache (skip the ViT) | 175.5 | 255.4 tok/s | **1.46x** |
+| + prefix KV cache (skip the whole prefill) | 175.5 | **322.9 tok/s** | **1.84x** |
+| vLLM (for reference) | 507.8 | 1372.2 tok/s | 2.70x |
+
+Takeaways, the honest version:
+- **At 0% reuse all three are equal** — the caches add no overhead, they only help
+  when content repeats.
+- The **vision cache** (cache ViT outputs) helps (1.46x) but is limited: the ViT
+  is only part of prefill. The **prefix KV cache** reuses the *entire* prefill —
+  on an exact (prompt tokens + image content) match it clones the cached KV and
+  skips the prefill forward — and wins (1.84x). This is the lever vLLM's prefix
+  cache and SGLang's radix cache pull; vLLM scales 2.70x because it also has paged
+  attention and fused kernels.
+- A measurement note that bit us: an early version warmed up with the same
+  workload, priming the cache so every timed request hit *regardless of reuse
+  rate* — which made the vision cache look useless. Cold-starting each trial fixed
+  it. (Measure, then doubt the measurement.)
+
+Reproduce: `run_omniserve.py --reuse 0.9 --prefix-cache` (or `--vision-cache`).
+
+## Result: vision embedding cache (standalone, batch=1 TTFT)
 Sweeping the image reuse rate on Qwen2-VL-2B (4-bit), baseline vs. cached:
 
 ![vision cache benchmark](benchmarks/results.png)

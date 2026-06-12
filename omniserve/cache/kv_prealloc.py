@@ -60,6 +60,28 @@ class PreallocatedKVCache:
         (cache.update(k, v, layer_idx) 约定)。"""
         return _PrefillWriter(self, slot)
 
+    def packed_prefill_cache(self, slots, seg_lengths):
+        """打包式 prefill 的 cache 适配器:一次前向打包了多个序列的 token,
+        update 时把每段的 KV 切出来写进对应槽位。块对角 mask 保证段间互不注意。"""
+        return _PackedPrefillWriter(self, slots, seg_lengths)
+
+
+class _PackedPrefillWriter:
+    def __init__(self, pool: PreallocatedKVCache, slots, seg_lengths):
+        self.pool, self.slots, self.seg = pool, slots, seg_lengths
+
+    def update(self, k, v, layer_idx):
+        # k, v: [1, n_kv_heads, total, head_dim](所有段打包在一起,rope 已应用)
+        off = 0
+        for slot, L in zip(self.slots, self.seg):
+            self.pool.k[layer_idx][slot, :, :L, :] = k[0, :, off:off + L, :]
+            self.pool.v[layer_idx][slot, :, :L, :] = v[0, :, off:off + L, :]
+            off += L
+        if layer_idx == self.pool.n_layers - 1:
+            for slot, L in zip(self.slots, self.seg):
+                self.pool.lengths[slot] = L
+        return k, v  # 注意力在打包序列上做,段内/段间由 mask 控制
+
 
 class _PrefillWriter:
     def __init__(self, pool: PreallocatedKVCache, slot: int):

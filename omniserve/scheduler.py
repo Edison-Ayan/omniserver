@@ -20,7 +20,8 @@ from .request import Sequence, Status
 @dataclass
 class SchedulerConfig:
     max_running: int = 8          # 同时 decode 的最大序列数(batch 上限)
-    max_prefill_per_step: int = 1  # 每次迭代 prefill 多少个新序列
+    max_prefill_per_step: int = 1  # 每步最多准入几个新序列(打包式 prefill 时调大)
+    max_prefill_tokens: int = 8192  # 每步 prefill 的 token 预算(打包多少个 prompt 进一次前向)
     max_seq_len: int = 4096        # prompt+output 长度的硬上限
 
 
@@ -58,21 +59,29 @@ class Scheduler:
         self.running = [s for s in self.running if s.status == Status.RUNNING]
 
         # 2) 在还有 batch 容量时准入等待中的序列(prefill)。
-        #    prefill 是多模态里最贵的一步,所以限制每次迭代准入的数量,
-        #    避免给已经在 decode 的序列带来延迟尖峰。
+        #    打包式 prefill:一步可以准入多个 prompt 打进一次前向,受两个上限约束——
+        #    数量上限 max_prefill_per_step,和 token 预算 max_prefill_tokens(总 prompt
+        #    token 数不超预算;至少准入一个,避免超长 prompt 永远进不来)。
         admitted = 0
+        used_tokens = 0
         while (
             self.waiting
             and len(self.running) < self.config.max_running
             and admitted < self.config.max_prefill_per_step
         ):
-            seq = self.waiting.popleft()
+            seq = self.waiting[0]
+            n_tok = seq.num_prompt_tokens
+            # 已经打包了至少一个、再加这个会超预算 -> 这步先不收
+            if admitted > 0 and used_tokens + n_tok > self.config.max_prefill_tokens:
+                break
+            self.waiting.popleft()
             if seq.status == Status.ABORTED:
                 continue
             seq.status = Status.RUNNING
             self.running.append(seq)
             out.prefill.append(seq)
             admitted += 1
+            used_tokens += n_tok
 
         # 3) 其余每个 running 序列前进一个 decode token。
         out.decode = [s for s in self.running if s not in out.prefill]

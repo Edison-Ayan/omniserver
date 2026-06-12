@@ -79,6 +79,11 @@ class NativeQwenVLRunner(ModelRunner):
 
     @torch.inference_mode()
     def prefill(self, seqs: List[Sequence]) -> None:
+        """打包式 prefill:把这一批序列的 prompt token 拼成一次前向,用块对角因果
+        mask 让每个 prompt 只注意自己内部。这样权重只读一次、GPU 喂满,替代原来
+        一个一个 prefill。每段的 KV 写进各自的池槽位。"""
+        dev = self.device
+        embeds, positions, seg_lens, slots, deltas = [], [], [], [], []
         for seq in seqs:
             p = self._pending.pop(seq.request_id)
             ids = p["ids"]
@@ -89,18 +94,36 @@ class NativeQwenVLRunner(ModelRunner):
                 emb[ids == self.image_token_id] = vis.to(emb.dtype)
             pos, delta = mrope_position_ids(ids, p["grid_thw"]) if p["grid_thw"] is not None \
                 else self._text_positions(ids)
-            rope_delta = int(delta.flatten()[0].item())
+            embeds.append(emb)                 # [1, L, hidden]
+            positions.append(pos)              # [3, 1, L]
+            seg_lens.append(L)
+            slots.append(len(self._slot_seq) + len(slots))
+            deltas.append(int(delta.flatten()[0].item()))
 
-            causal = torch.full((L, L), float("-inf"), device=self.device,
-                                dtype=torch.float16).triu(1)[None, None]
-            slot = len(self._slot_seq)
-            cache = self._pool.prefill_cache(slot)
-            logits = self.llm(emb, pos, causal, cache)[:, -1, :]
+        packed_emb = torch.cat(embeds, dim=1)          # [1, total, hidden]
+        packed_pos = torch.cat(positions, dim=2)       # [3, 1, total]
+        total = sum(seg_lens)
+        # 块对角因果 mask:每段内部是因果,段之间互不可见(保持各 prompt 独立)
+        mask = torch.full((total, total), float("-inf"), device=dev, dtype=torch.float16)
+        off = 0
+        for L in seg_lens:
+            mask[off:off + L, off:off + L] = torch.triu(
+                torch.full((L, L), float("-inf"), device=dev, dtype=torch.float16), 1)
+            off += L
+        mask = mask[None, None]                        # [1, 1, total, total]
 
+        cache = self._pool.packed_prefill_cache(slots, seg_lens)
+        logits = self.llm(packed_emb, packed_pos, mask, cache)[0]   # [total, vocab]
+
+        # 每段最后一个 token 的 logits -> 该序列的第一个生成 token
+        off = 0
+        for i, seq in enumerate(seqs):
+            L = seg_lens[i]
             self._slot_seq.append(seq)
-            seq.kv_handle = {"slot": slot, "rope_delta": rope_delta}
-            seq.append_token(self._sample(logits, seq))
+            seq.kv_handle = {"slot": slots[i], "rope_delta": deltas[i]}
+            seq.append_token(self._sample(logits[off + L - 1: off + L], seq))
             seq.maybe_finish()
+            off += L
 
     @staticmethod
     def _text_positions(ids):

@@ -1,17 +1,15 @@
-"""From-scratch Qwen2 language-model forward (the text decoder of Qwen2-VL).
+"""从零实现的 Qwen2 语言模型 forward(Qwen2-VL 的文本解码器)。
 
-This replaces transformers' `Qwen2VLForConditionalGeneration` language stack so
-the engine controls the forward — the prerequisite for varlen/packed prefill,
-mixed batching, and fused kernels that HF's forward can't express. The vision
-encoder (ViT) is left to HF for now; its embeddings are spliced into the text
-embeddings before this forward runs.
+它替代 transformers 的 `Qwen2VLForConditionalGeneration` 语言部分,让引擎自己控制
+forward——这是做 varlen/packed prefill、混合 batching、融合 kernel 的前提(HF 的
+forward 表达不了这些)。vision 编码器(ViT)由 model/qwen2_vit.py 自己实现;它的
+embedding 在本 forward 跑之前被拼进文本 embedding。
 
-Architecture (Qwen2-VL-2B): hidden 1536, 28 layers, 12 query heads / 2 KV heads
-(GQA), head_dim 128, SwiGLU intermediate 8960, RMSNorm eps 1e-6, rope_theta 1e6,
-M-RoPE sections [16,24,24], tied embeddings, q/k/v have bias, o does not.
+架构(Qwen2-VL-2B):hidden 1536,28 层,12 query 头 / 2 KV 头(GQA),head_dim 128,
+SwiGLU intermediate 8960,RMSNorm eps 1e-6,rope_theta 1e6,M-RoPE section [16,24,24],
+tied embeddings,q/k/v 带 bias、o 不带。
 
-Correctness is the bar: token-identical to HF (verified in
-scripts/proto_custom_llm.py). Optimizations come after.
+正确性是底线:和 HF 逐 token 一致(scripts/proto_custom_llm.py 验证)。优化在后面。
 """
 
 from __future__ import annotations
@@ -57,8 +55,8 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def apply_mrope(q, k, cos, sin, mrope_section):
-    """M-RoPE: cos/sin are [3, B, L, head_dim] (one per t/h/w position axis).
-    Each frequency band is driven by one axis per the doubled mrope_section."""
+    """M-RoPE:cos/sin 是 [3, B, L, head_dim](t/h/w 三个位置轴各一份)。
+    按加倍后的 mrope_section,每个频率带由其中一个轴驱动。"""
     sec = mrope_section * 2
     cos = torch.cat([m[i % 3] for i, m in enumerate(cos.split(sec, dim=-1))], dim=-1).unsqueeze(1)
     sin = torch.cat([m[i % 3] for i, m in enumerate(sin.split(sec, dim=-1))], dim=-1).unsqueeze(1)
@@ -84,8 +82,8 @@ class Attention(nn.Module):
         v = self.v_proj(x).view(B, L, self.nkv, self.hd).transpose(1, 2)
         q, k = apply_mrope(q, k, cos, sin, self.mrope_section)
         if cache is not None:
-            k, v = cache.update(k, v, layer_idx)   # returns the full K/V window
-        # GQA: expand KV heads to match query heads
+            k, v = cache.update(k, v, layer_idx)   # 返回完整的 K/V 窗口
+        # GQA:把 KV 头扩展到和 query 头数对齐
         rep = self.nh // self.nkv
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)
@@ -127,7 +125,7 @@ class Qwen2LLM(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer(cfg) for _ in range(cfg.num_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
-        self.lm_head.weight = self.embed_tokens.weight  # tied (saves ~0.5 GB)
+        self.lm_head.weight = self.embed_tokens.weight  # tied 共享(省 ~0.5 GB)
         inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, cfg.head_dim, 2).float() / cfg.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -149,16 +147,15 @@ class Qwen2LLM(nn.Module):
 
 
 def load_from_hf(model: Qwen2LLM, hf_state_dict: dict) -> None:
-    """Copy weights from a Qwen2VL state_dict into the custom model. Handles both
-    the raw safetensors layout (`model.layers...`) and the loaded-model layout
-    (`model.language_model.layers...`)."""
+    """把 Qwen2VL 的 state_dict 权重拷进自定义模型。同时支持两种命名:raw
+    safetensors 布局(`model.layers...`)和加载后模型布局(`model.language_model.layers...`)。"""
     sd = hf_state_dict
     # 踩坑:raw safetensors 用 `model.layers.` 前缀,而 transformers 加载后的
     # state_dict() 是 `model.language_model.layers.`(新版重构了结构)。两种都支持。
     P = "model.language_model." if "model.language_model.embed_tokens.weight" in sd else "model."
     model.embed_tokens.weight.data.copy_(sd[P + "embed_tokens.weight"])
     model.norm.weight.data.copy_(sd[P + "norm.weight"])
-    # lm_head is tied to embed_tokens (same tensor), so it's already loaded
+    # lm_head 和 embed_tokens 是 tied(同一个张量),所以已经一起加载好了
     for i, layer in enumerate(model.layers):
         lp = f"{P}layers.{i}."
         a = layer.self_attn

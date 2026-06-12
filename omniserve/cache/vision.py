@@ -1,22 +1,19 @@
-"""Vision embedding cache for Qwen2-VL.
+"""Qwen2-VL 的 vision embedding cache。
 
-In a VLM the prefill cost has two parts: the vision encoder (ViT) turning pixels
-into vision tokens, and the language model attending over text+vision tokens.
-When the same image recurs across requests (multi-turn chat, repeated system
-images) the ViT is recomputed even though its output is identical. We cache the
-ViT output keyed by image content so repeated images skip the encoder.
+在 VLM 里 prefill 成本有两部分:vision 编码器(ViT)把像素变成 vision token,以及
+语言模型对 文本+vision token 做注意力。当同一张图在多个请求间重复出现(多轮对话、
+重复的 system 图)时,ViT 会被重算,尽管输出完全一样。我们按图像内容做 key 缓存 ViT
+输出,这样重复的图直接跳过编码器。
 
-Hook point (verified against transformers 4.57, Qwen2-VL): the model calls
+挂载点(对 transformers 4.57 / Qwen2-VL 验证过):模型会调用
     self.visual(pixel_values, grid_thw=image_grid_thw) -> image_embeds
-where `model.visual` is the Qwen2VisionTransformerPretrainedModel. We monkeypatch
-its `forward`. An LRU bound keeps cache memory flat.
+其中 `model.visual` 是 Qwen2VisionTransformerPretrainedModel。我们 monkeypatch 它的
+`forward`。LRU 上界让 cache 内存保持平稳。
 
-Content addressing: the cache key is a hash of the *image content*. The runner
-computes it once when a request arrives (`image_key`) and hands it to the cache
-via `set_pending` before each prefill, so a cache lookup is O(1) instead of
-re-hashing the full pixel tensor on every ViT call. When no precomputed key is
-supplied (e.g. the standalone benchmark calling the model directly), it falls
-back to hashing the pixel tensor.
+内容寻址:cache key 是**图像内容**的 hash。runner 在请求到来时算一次(`image_key`),
+每次 prefill 前通过 `set_pending` 交给 cache,这样查表是 O(1),不用每次 ViT 调用都
+重新 hash 整个像素张量。没有预算 key 时(比如独立 benchmark 直接调模型),回退到对
+像素张量做 hash。
 """
 
 from __future__ import annotations
@@ -53,16 +50,16 @@ class VisionEmbeddingCache:
         self.stats = CacheStats()
         self._orig_forward = None
         self._visual = None
-        self._pending: Optional[List[str]] = None  # content keys for next forward
+        self._pending: Optional[List[str]] = None  # 下次前向用的内容 key
 
     @staticmethod
     def image_key(image: Image.Image) -> str:
-        """Content hash of an image, computed once at request ingest."""
+        """图像的内容 hash,在请求 ingest 时算一次。"""
         return hashlib.sha1(image.tobytes()).hexdigest()
 
     def set_pending(self, keys: Optional[List[str]]) -> None:
-        """Supply the content keys for the images in the upcoming forward.
-        One key per image, in the order the processor laid them out."""
+        """提供即将到来的前向里各图像的内容 key。
+        每张图一个 key,顺序和 processor 排布的一致。"""
         self._pending = keys
 
     @staticmethod
@@ -73,13 +70,13 @@ class VisionEmbeddingCache:
         return h.hexdigest()
 
     def install(self, model) -> "VisionEmbeddingCache":
-        visual = model.visual  # aliased to model.model.visual; same object
+        visual = model.visual  # 是 model.model.visual 的别名;同一个对象
         self._visual = visual
         self._orig_forward = visual.forward
 
         def cached_forward(hidden_states, grid_thw, **kwargs):
-            # Use the precomputed content key only when it unambiguously maps to
-            # this call (a single image); otherwise hash the pixels as a fallback.
+            # 只在预算 key 能无歧义对应这次调用(单张图)时用它;
+            # 否则回退到对像素做 hash。
             key = None
             if self._pending is not None and len(self._pending) == 1 \
                     and grid_thw is not None and grid_thw.shape[0] == 1:
@@ -108,8 +105,8 @@ class VisionEmbeddingCache:
         return self
 
     def clear(self) -> None:
-        """Drop cached embeddings and reset stats (for cold-start benchmarking).
-        Keeps the monkeypatch installed."""
+        """丢掉缓存的 embedding 并重置统计(用于冷启动 benchmark)。
+        保持 monkeypatch 仍然装着。"""
         self._store.clear()
         self.stats = CacheStats()
 

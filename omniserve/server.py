@@ -1,17 +1,15 @@
-"""OpenAI-compatible HTTP server for omniserve.
+"""omniserve 的 OpenAI 兼容 HTTP server。
 
-Exposes `POST /v1/chat/completions` (streaming + non-streaming) backed by the
-continuous-batching engine, so it behaves like a drop-in multimodal endpoint —
-the same shape you'd hit on vLLM's server. Images are accepted in the OpenAI
-vision format (`image_url` with a base64 data URI).
+暴露 `POST /v1/chat/completions`(流式 + 非流式),底层是 continuous-batching 引擎,
+所以它表现得像一个 drop-in 的多模态端点——和 vLLM server 一样的接口形态。图像以
+OpenAI vision 格式接收(`image_url` 里放 base64 data URI)。
 
-The engine is not thread-safe and runs the model on the GPU, so it lives on a
-single background thread. HTTP handlers submit a Request and drain that
-request's output via a thread-safe queue, bridged to asyncio with run_in_executor.
+引擎不是线程安全的,而且在 GPU 上跑模型,所以它跑在单个后台线程上。HTTP handler 提交
+一个 Request,通过线程安全队列取出该请求的输出,再用 run_in_executor 桥接到 asyncio。
 
-Run:
+运行:
     python -m omniserve.server --port 8000 [--fp16] [--prefix-cache]
-Then:
+然后:
     curl localhost:8000/v1/chat/completions -d '{"model":"qwen2-vl","messages":[...]}'
 """
 
@@ -45,7 +43,7 @@ MODEL_NAME = "omniserve-qwen2-vl"
 
 
 # --------------------------------------------------------------------------- #
-# Engine service: drives the step loop on a background thread.
+# Engine service:在后台线程上驱动步进循环。
 # --------------------------------------------------------------------------- #
 class EngineService:
     def __init__(self, runner, sched_config: SchedulerConfig):
@@ -73,7 +71,7 @@ class EngineService:
 
     def _loop(self) -> None:
         while True:
-            # If idle, block until a request arrives; otherwise just poll.
+            # 空闲时阻塞等请求到来;否则只是轮询。
             self._drain_submissions(block=not self.engine.has_unfinished())
             if not self.engine.has_unfinished():
                 continue
@@ -86,7 +84,7 @@ class EngineService:
 
 
 # --------------------------------------------------------------------------- #
-# OpenAI request parsing / response shaping.
+# OpenAI 请求解析 / 响应组装。
 # --------------------------------------------------------------------------- #
 def _decode_image(url: str) -> Image.Image:
     if url.startswith("data:"):
@@ -95,8 +93,8 @@ def _decode_image(url: str) -> Image.Image:
 
 
 def parse_messages(messages: List[dict]) -> Tuple[str, List[Image.Image]]:
-    """Flatten OpenAI chat messages into (prompt_text, images). The engine's
-    runner formats a single user turn, so we concatenate text and collect images.
+    """把 OpenAI chat messages 摊平成 (prompt_text, images)。引擎的 runner 只格式化
+    单轮 user 对话,所以这里把文本拼起来、把图收集起来。
     """
     texts: List[str] = []
     images: List[Image.Image] = []

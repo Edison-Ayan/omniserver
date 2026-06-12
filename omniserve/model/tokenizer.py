@@ -1,6 +1,5 @@
-"""Qwen2-VL tokenizer + chat template on the standalone `tokenizers` library
-(no transformers). Loads tokenizer.json, applies the chat template, and expands
-each image placeholder to its vision-token count.
+"""基于独立的 `tokenizers` 库(不用 transformers)的 Qwen2-VL tokenizer + chat 模板。
+加载 tokenizer.json,套用 chat 模板,并把每个图像占位符展开成它的 vision-token 数量。
 """
 
 from __future__ import annotations
@@ -43,8 +42,8 @@ class Qwen2VLTokenizer:
         return t * (h // MERGE_SIZE) * (w // MERGE_SIZE)
 
     def build_prompt(self, text: str, image_grids: List = ()) -> str:
-        """Single user turn: system + (vision blocks) + text, with the assistant
-        generation prefix. Each image expands to its vision-token count."""
+        """单轮 user 对话:system +(vision 块)+ text,再加 assistant 生成前缀。
+        每张图展开成它的 vision-token 数量。"""
         vision = ""
         for grid in image_grids:
             n = self._n_vision_tokens(grid)

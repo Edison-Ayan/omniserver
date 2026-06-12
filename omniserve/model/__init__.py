@@ -1,6 +1,6 @@
-"""From-scratch model forwards owned by the engine (no HF forward).
+"""引擎自己持有的从零实现 model forward(不用 HF forward)。
 
-`qwen2_llm` is the Qwen2-VL text decoder; the vision encoder is still HF's.
+`qwen2_llm` 是 Qwen2-VL 文本解码器,`qwen2_vit` 是视觉编码器,都是自写的。
 """
 
 from .qwen2_llm import Qwen2Config, Qwen2LLM, load_from_hf

@@ -1,22 +1,19 @@
-"""QwenVLRunner — the real model backend for Qwen2-VL-2B.
+"""QwenVLRunner —— Qwen2-VL-2B 的真实模型后端(基于 HF,用于参照/对比)。
 
-This is where omniserve actually runs the model. Unlike a blackbox
-`model.generate()` call, the engine needs prefill and single-token decode as
-separate operations so the scheduler can admit/retire sequences every step
-(continuous batching). That means we manage the KV cache ourselves.
+这是 omniserve 真正跑模型的地方。和黑盒的 `model.generate()` 不同,引擎需要把
+prefill 和单 token decode 拆成两个独立操作,这样调度器才能每步准入/退休序列
+(continuous batching)。这意味着 KV cache 由我们自己管。
 
-Qwen2-VL specifics we handle:
-  - multimodal prefill: processor turns (text, image) into input_ids +
-    pixel_values + image_grid_thw; the model merges vision tokens internally.
-  - M-RoPE: Qwen2-VL uses 3D rotary positions. `Qwen2VLModel.forward` computes
-    position_ids itself when given `cache_position` and a stored `rope_deltas`,
-    so per sequence we stash the `rope_deltas` produced at prefill and restore
-    it before each decode step.
+我们处理的 Qwen2-VL 细节:
+  - 多模态 prefill:processor 把 (文本, 图) 变成 input_ids + pixel_values +
+    image_grid_thw;模型内部把 vision token 合并进去。
+  - M-RoPE:Qwen2-VL 用 3D 旋转位置。给定 `cache_position` 和存好的 `rope_deltas`
+    时 `Qwen2VLModel.forward` 会自己算 position_ids,所以我们按序列存好 prefill 时
+    产生的 `rope_deltas`,每个 decode 步前恢复它。
 
-Stage 1 (this file): correct prefill + decode with a per-sequence DynamicCache.
-Sequences in a scheduler step are executed one at a time inside the runner; the
-control plane (batching/streaming) is already real. Stage 2 will fuse multiple
-sequences into a single batched forward for throughput.
+Stage 1(本文件):用每序列一个 DynamicCache 做正确的 prefill + decode。一个调度步里
+的序列在 runner 内部一个一个执行;控制平面(batching/流式)已经是真的。Stage 2 把多个
+序列融进单个批量前向以提吞吐。
 """
 
 from __future__ import annotations
@@ -45,24 +42,23 @@ class QwenVLRunner(ModelRunner):
             patch_llm_rmsnorm(self.model)
         self.device = next(self.model.parameters()).device
         self.eos_ids = {self.model.config.eos_token_id}
-        # per-request stash for prompt-stage tensors (pixel_values etc.)
+        # 每请求暂存 prompt 阶段的张量(pixel_values 等)
         self._pending: Dict[str, dict] = {}
-        # per-request precomputed image content keys (for the caches)
+        # 每请求预先算好的图像内容 key(给各 cache 用)
         self._img_keys: Dict[str, list] = {}
-        # optional prefix KV cache (reuse the whole prefill for repeated prefixes)
+        # 可选的 prefix KV cache(相同前缀复用整段 prefill)
         self.prefix_cache = prefix_cache
-        # optional vision embedding cache (installed on the model)
+        # 可选的 vision embedding cache(装在模型上)
         self.vision_cache = vision_cache
         if vision_cache is not None:
             vision_cache.install(self.model)
 
-        # Preallocated KV pool: write the new token in place instead of the
-        # O(L^2) cat-based DynamicCache rebuild each decode step. Slots [0,n) hold
-        # the active sequences; finishing a sequence compacts the pool.
+        # 预分配 KV 池:每个 decode 步原地写入新 token,而不是 cat-based DynamicCache
+        # 那样 O(L^2) 重建。槽位 [0,n) 放活跃序列;序列跑完时紧凑化池。
         self.prealloc_kv = prealloc_kv
         self._max_len = max_len
         self._pool = None
-        self._slot_seq: List = []   # _slot_seq[slot] -> Sequence in that slot
+        self._slot_seq: List = []   # _slot_seq[slot] -> 该槽位里的 Sequence
         if prealloc_kv:
             cfg = self.model.config
             from ..cache.kv_prealloc import PreallocatedKVCache
@@ -87,7 +83,7 @@ class QwenVLRunner(ModelRunner):
     # ---- ModelRunner interface ---------------------------------------------
 
     def tokenize(self, seq: Sequence) -> None:
-        """Build the chat-formatted multimodal inputs and stash the tensors."""
+        """构造 chat 格式的多模态输入,并暂存张量。"""
         req = seq.request
         content = []
         for _ in req.images:
@@ -101,14 +97,14 @@ class QwenVLRunner(ModelRunner):
         seq.prompt_token_ids = inputs["input_ids"][0].tolist()
         self._pending[seq.request_id] = inputs
 
-        # content-address the images once, here: used by the vision cache (O(1)
-        # ViT lookup) and the prefix cache (part of the prefix key).
+        # 在这里对图像做一次内容寻址:给 vision cache 用(O(1) 查 ViT)和
+        # prefix cache 用(作为前缀 key 的一部分)。
         if (self.vision_cache is not None or self.prefix_cache is not None) and req.images:
             from ..cache.vision import VisionEmbeddingCache
             self._img_keys[seq.request_id] = [
                 VisionEmbeddingCache.image_key(im) for im in req.images]
 
-        # make sure per-sequence stop ids include EOS
+        # 确保每序列的 stop id 里包含 EOS
         sp = seq.request.sampling
         for e in self.eos_ids:
             if e is not None and e not in sp.stop_token_ids:
@@ -116,14 +112,14 @@ class QwenVLRunner(ModelRunner):
 
     @staticmethod
     def _clone_cache(cache):
-        """Deep-copy a DynamicCache so two sequences can grow it independently."""
+        """深拷贝一个 DynamicCache,让两个序列能各自独立地往里追加。"""
         from transformers import DynamicCache
         legacy = [(k.clone(), v.clone()) for (k, v) in cache.to_legacy_cache()]
         return DynamicCache.from_legacy_cache(legacy)
 
     def _store_prefill(self, seq, cache, length: int, rope_delta: int) -> None:
-        """Park a sequence's prefill KV: into a pool slot (prealloc) or keep the
-        per-sequence DynamicCache (legacy path)."""
+        """存放一个序列的 prefill KV:放进池槽位(预分配),或保留每序列的
+        DynamicCache(旧路径)。"""
         if self.prealloc_kv:
             slot = len(self._slot_seq)
             self._pool.set_slot_prefix(slot, cache.to_legacy_cache(), length)
@@ -141,8 +137,8 @@ class QwenVLRunner(ModelRunner):
             img_keys = self._img_keys.pop(seq.request_id, None)
             L = inputs["input_ids"].shape[1]
 
-            # Prefix KV cache: identical (prompt tokens + images) -> reuse the
-            # whole prefill. A hit clones the cached KV and skips the forward.
+            # Prefix KV cache:相同的(prompt token + 图)-> 复用整段 prefill。
+            # 命中时 clone 缓存的 KV,跳过前向。
             pkey = None
             if self.prefix_cache is not None:
                 pkey = self.prefix_cache.prefix_key(seq.prompt_token_ids, img_keys)
@@ -168,9 +164,8 @@ class QwenVLRunner(ModelRunner):
             next_id = self._sample(out.logits[:, -1, :], seq)
             rope_delta = int(self.model.model.rope_deltas.flatten()[0].item())
 
-            # Store a clone for the prefix cache BEFORE the pool consumes `cache`
-            # (set_slot_prefix only reads it, but cloning keeps the cached copy
-            # independent of any later in-place writes).
+            # 在池消费 `cache` 之前,先给 prefix cache 存一份 clone
+            # (set_slot_prefix 只读它,但 clone 能让缓存副本独立于之后的原地写)。
             if self.prefix_cache is not None:
                 from ..cache.prefix import PrefixEntry
                 self.prefix_cache.put(pkey, PrefixEntry(
@@ -188,24 +183,23 @@ class QwenVLRunner(ModelRunner):
 
     @torch.inference_mode()
     def _decode_prealloc(self, seqs: List[Sequence]) -> None:
-        """Advance all running sequences one token in a single forward, writing
-        each new token's KV in place into the preallocated pool (no per-step
-        rebuild). Active sequences occupy contiguous slots [0, n); we order the
-        batch by slot so row b == slot b."""
+        """所有在跑序列在单次前向里前进一个 token,把每个新 token 的 KV 原地写进
+        预分配池(不每步重建)。活跃序列占连续槽位 [0, n);我们按槽位给 batch 排序,
+        使得 row b == slot b。"""
         seqs = sorted(seqs, key=lambda s: s.kv_handle["slot"])
         n = len(seqs)
         assert all(seqs[b].kv_handle["slot"] == b for b in range(n)), \
-            "decode slots must be the contiguous prefix [0, n)"
+            "decode 槽位必须是连续前缀 [0, n)"
         device = self.device
 
         view = self._pool.view(n)
-        wpos = view.write_pos              # [n] per-slot position of the new token
+        wpos = view.write_pos              # [n] 每个槽位新 token 的位置
         ret = view.ret_len
         input_ids = torch.tensor([[s.last_token_id()] for s in seqs], device=device)
         rope = torch.tensor([s.kv_handle["rope_delta"] for s in seqs], device=device)
         attn = torch.zeros(n, ret, device=device, dtype=torch.long)
         for b in range(n):
-            attn[b, : wpos[b] + 1] = 1     # new token attends to [0, wpos]
+            attn[b, : wpos[b] + 1] = 1     # 新 token 注意到 [0, wpos]
         pos = torch.empty(3, n, 1, device=device, dtype=torch.long)
         pos[:, :, 0] = (wpos + rope).unsqueeze(0)
 
@@ -218,9 +212,8 @@ class QwenVLRunner(ModelRunner):
             seq.maybe_finish()
 
     def free(self, seq: Sequence) -> None:
-        """Release a finished sequence's pool slot, compacting so active slots
-        stay the contiguous prefix [0, n): move the last active sequence into the
-        freed slot."""
+        """释放跑完序列的池槽位,并紧凑化让活跃槽位保持连续前缀 [0, n):
+        把最后一个活跃序列移到空出来的槽位。"""
         if not self.prealloc_kv:
             return
         slot = seq.kv_handle.get("slot")
@@ -236,8 +229,8 @@ class QwenVLRunner(ModelRunner):
 
     @torch.inference_mode()
     def _decode_cat(self, seqs: List[Sequence]) -> None:
-        """Legacy path: rebuild a left-padded batched DynamicCache each step
-        (O(L^2) cat). Kept for A/B comparison against the preallocated pool."""
+        """旧路径:每步重建一个左 padding 的批量 DynamicCache(O(L^2) cat)。
+        保留它是为了和预分配池做 A/B 对比。"""
         from transformers import DynamicCache
 
         B = len(seqs)
@@ -245,7 +238,7 @@ class QwenVLRunner(ModelRunner):
         lens = [s.kv_handle["len"] for s in seqs]
         max_len = max(lens)
 
-        # 1) build a batched, left-padded KV cache from each sequence's cache
+        # 1) 从每个序列的 cache 拼出一个左 padding 的批量 KV cache
         legs = [s.kv_handle["cache"].to_legacy_cache() for s in seqs]
         n_layers = len(legs[0])
         batched = []
@@ -262,7 +255,7 @@ class QwenVLRunner(ModelRunner):
             batched.append((torch.cat(ks, 0), torch.cat(vs, 0)))
         bcache = DynamicCache.from_legacy_cache(batched)
 
-        # 2) batched inputs: last token, mask (left-padding), explicit positions
+        # 2) 批量输入:最后一个 token、mask(左 padding)、显式 position
         input_ids = torch.tensor([[s.last_token_id()] for s in seqs], device=device)
         attn = torch.zeros(B, max_len + 1, device=device, dtype=torch.long)
         pos = torch.empty(3, B, 1, device=device, dtype=torch.long)
@@ -275,10 +268,9 @@ class QwenVLRunner(ModelRunner):
                          cache_position=torch.tensor([max_len], device=device))
         logits = out.logits[:, -1, :]  # [B, vocab]
 
-        # 3) append ONLY the new token's KV to each sequence's own cache.
-        #    The old KV is unchanged, so we copy a single position per layer
-        #    instead of rebuilding the whole per-sequence cache (the new token
-        #    sits at index max_len in the batched cache after the forward).
+        # 3) 只把新 token 的 KV 追加到每个序列自己的 cache。
+        #    旧 KV 没变,所以每层只拷贝一个位置,而不是重建整个 per-sequence cache
+        #    (前向后,新 token 在批量 cache 里位于 index max_len)。
         new_legs = bcache.to_legacy_cache()
         for b, seq in enumerate(seqs):
             cache = seq.kv_handle["cache"]

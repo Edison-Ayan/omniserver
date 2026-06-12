@@ -1,18 +1,15 @@
-"""Preallocated batched KV cache (the spirit of PagedAttention without a kernel).
+"""预分配的批量 KV cache(PagedAttention 的思路,但不用写 kernel)。
 
-The cat-based DynamicCache grows the KV by `torch.cat` every decode step (O(L) a
-step, O(L^2) over a sequence), and our batched decode additionally rebuilt the
-whole batched cache each step (legacy round-trip + pad + cat + scatter). This
-class preallocates one fixed `[B, H, max_len, D]` buffer per layer and writes the
-new token's KV **in place** at each slot's current length — no growth, no rebuild.
+cat-based 的 DynamicCache 每个 decode 步用 `torch.cat` 让 KV 增长(每步 O(L),整条
+序列 O(L^2)),而我们的批量 decode 还额外每步重建整个批量 cache(legacy 往返 + pad +
+cat + scatter)。这个类给每层预分配一个固定的 `[B, H, max_len, D]` buffer,把新 token
+的 KV **原地**写到每个槽位的当前长度处——不增长、不重建。
 
-Slots: each running sequence owns a row `b`. `lengths[b]` is its valid KV length,
-which is also where the next token is written. Different rows are at different
-lengths (ragged), so writes are per-row scatters and attention uses a mask.
+槽位:每个在跑序列占一行 `b`。`lengths[b]` 是它有效的 KV 长度,也是下一个 token 写入的
+位置。不同行长度不同(ragged),所以写入是逐行 scatter,注意力用 mask。
 
-This implements just enough of the transformers Cache interface for Qwen2-VL's
-decode forward (`update`, `get_seq_length`). It is token-identical to the
-cat-based path (verified in scripts/proto_prealloc_kv.py).
+它只实现了 Qwen2-VL decode 前向需要的那部分 transformers Cache 接口(`update`、
+`get_seq_length`)。和 cat-based 路径逐 token 一致(scripts/proto_prealloc_kv.py 验证)。
 """
 
 from __future__ import annotations
@@ -33,13 +30,13 @@ class PreallocatedKVCache:
                               device=device, dtype=dtype) for _ in range(n_layers)]
         self.v = [torch.zeros(max_batch, n_kv_heads, max_len, head_dim,
                               device=device, dtype=dtype) for _ in range(n_layers)]
-        # valid length per slot == write position for the next token
+        # 每个槽位的有效长度 == 下一个 token 的写入位置
         self.lengths = torch.zeros(max_batch, dtype=torch.long, device=device)
-        self._active = 0  # number of slots in use (rows [0, _active) are live)
+        self._active = 0  # 在用的槽位数(行 [0, _active) 是活的)
 
-    # ---- population (prefill) ------------------------------------------------
+    # ---- 填充(prefill)------------------------------------------------------
     def set_slot_prefix(self, slot: int, legacy_kv, length: int) -> None:
-        """Copy a prefill result (a to_legacy_cache() tuple) into a slot."""
+        """把一个 prefill 结果(to_legacy_cache() 的 tuple)拷进某个槽位。"""
         for li, (k, v) in enumerate(legacy_kv):
             self.k[li][slot, :, :length, :] = k[0]
             self.v[li][slot, :, :length, :] = v[0]
@@ -47,20 +44,20 @@ class PreallocatedKVCache:
         self._active = max(self._active, slot + 1)
 
     def move_slot(self, src: int, dst: int) -> None:
-        """Move a sequence's KV from slot `src` to `dst` (used to compact the pool
-        when a sequence in the middle finishes). Copies the full row per layer."""
+        """把一个序列的 KV 从槽位 `src` 移到 `dst`(中间某序列跑完时用来紧凑化池)。
+        每层拷贝整行。"""
         for li in range(self.n_layers):
             self.k[li][dst].copy_(self.k[li][src])
             self.v[li][dst].copy_(self.v[li][src])
         self.lengths[dst] = self.lengths[src]
 
     def view(self, n: int):
-        """Return a cache view bound to the first `n` active slots for a forward."""
+        """返回一个绑定到前 `n` 个活跃槽位的 cache view,供一次前向使用。"""
         return _CacheView(self, n)
 
     def prefill_cache(self, slot: int):
-        """Cache adapter for the native forward to write one sequence's prefill
-        KV into `slot` (cache.update(k, v, layer_idx) convention)."""
+        """给原生 forward 用的 cache 适配器,把一个序列的 prefill KV 写进 `slot`
+        (cache.update(k, v, layer_idx) 约定)。"""
         return _PrefillWriter(self, slot)
 
 
@@ -69,28 +66,28 @@ class _PrefillWriter:
         self.pool, self.slot = pool, slot
 
     def update(self, k, v, layer_idx):
-        # k, v: [1, n_kv_heads, L, head_dim] (rope already applied by the caller)
+        # k, v: [1, n_kv_heads, L, head_dim](rope 已由调用方应用)
         L = k.shape[2]
         self.pool.k[layer_idx][self.slot, :, :L, :] = k[0]
         self.pool.v[layer_idx][self.slot, :, :L, :] = v[0]
         if layer_idx == self.pool.n_layers - 1:
             self.pool.lengths[self.slot] = L
-        return k, v  # prefill attends to its own K/V
+        return k, v  # prefill 注意它自己的 K/V
 
 
 class _CacheView:
-    """A per-forward adapter passed as `past_key_values`. `update` writes the new
-    token in place at each active slot's length and returns the valid KV window."""
+    """作为 `past_key_values` 传入的「单次前向」适配器。`update` 把新 token 原地写到
+    每个活跃槽位的长度处,并返回有效的 KV 窗口。"""
 
     def __init__(self, pool: PreallocatedKVCache, n: int):
         self.pool = pool
         self.n = n
-        self.write_pos = pool.lengths[:n].clone()      # position to write this step
+        self.write_pos = pool.lengths[:n].clone()      # 这一步要写入的位置
         self.ret_len = int(self.write_pos.max().item()) + 1
         self._rows = torch.arange(n, device=pool.lengths.device)
 
     def update(self, key, value, layer_idx, cache_kwargs=None):
-        # key/value: [n, H, 1, D] (single new token per slot)
+        # key/value: [n, H, 1, D](每个槽位一个新 token)
         k_buf, v_buf = self.pool.k[layer_idx], self.pool.v[layer_idx]
         k_buf[self._rows, :, self.write_pos, :] = key[:, :, 0, :]
         v_buf[self._rows, :, self.write_pos, :] = value[:, :, 0, :]
@@ -102,7 +99,7 @@ class _CacheView:
         return self.ret_len - 1
 
     def get_mask_sizes(self, cache_position, layer_idx: int = 0):
-        # (kv_length, kv_offset): the returned KV window has ret_len keys at offset 0
+        # (kv_length, kv_offset):返回的 KV 窗口有 ret_len 个 key,offset 为 0
         return self.ret_len, 0
 
     def get_max_cache_shape(self):

@@ -1,13 +1,11 @@
-"""Fused RMSNorm Triton kernel + a drop-in replacement for Qwen2RMSNorm.
+"""融合的 RMSNorm Triton kernel + Qwen2RMSNorm 的 drop-in 替代。
 
-HF's `Qwen2RMSNorm` runs as several PyTorch ops (upcast, square, mean, rsqrt,
-multiply, downcast, weight multiply) — each a separate kernel reading/writing the
-activation from HBM. RMSNorm is memory-bound, so fusing the whole thing into one
-Triton kernel (one read, one write) is the textbook win.
+HF 的 `Qwen2RMSNorm` 跑成好几个 PyTorch op(upcast、平方、求均值、rsqrt、乘、downcast、
+乘权重)——每个都是单独的 kernel,各从 HBM 读写一遍激活。RMSNorm 是访存受限的,所以
+把整件事融合进一个 Triton kernel(一次读、一次写)是教科书式的优化。
 
-It matches HF's numerics: reduce in fp32 for stability, then scale by the weight
-and store in the input dtype. Targets the LLM stack (dim 1536); the ViT uses
-LayerNorm, not RMSNorm, so it is left untouched.
+它和 HF 的数值对齐:在 fp32 里 reduce 以保稳定,再乘权重、按输入 dtype 存。针对 LLM
+栈(dim 1536);ViT 用的是 LayerNorm 不是 RMSNorm,所以不动它。
 """
 
 from __future__ import annotations
@@ -48,11 +46,11 @@ def rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 class FusedRMSNorm(torch.nn.Module):
-    """Drop-in for transformers' Qwen2RMSNorm, backed by the Triton kernel."""
+    """transformers Qwen2RMSNorm 的 drop-in 替代,底层用 Triton kernel。"""
 
     def __init__(self, weight: torch.Tensor, eps: float):
         super().__init__()
-        self.weight = weight  # share the original parameter (no copy)
+        self.weight = weight  # 共享原参数(不拷贝)
         self.variance_epsilon = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -60,8 +58,8 @@ class FusedRMSNorm(torch.nn.Module):
 
 
 def patch_llm_rmsnorm(model) -> int:
-    """Replace every Qwen2RMSNorm in the language model with FusedRMSNorm.
-    Returns the number of modules swapped. The ViT (LayerNorm) is left alone."""
+    """把语言模型里的每个 Qwen2RMSNorm 换成 FusedRMSNorm。
+    返回替换的模块数。ViT(LayerNorm)不动。"""
     from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2RMSNorm
 
     n = 0

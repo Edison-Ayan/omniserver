@@ -1,9 +1,8 @@
-"""Qwen2-VL image preprocessing (reimplements the HF image processor).
+"""Qwen2-VL 图像预处理(重实现 HF 的 image processor)。
 
-PIL image -> (pixel_values [num_patches, 1176], grid_thw [1, 3]). Smart-resize to
-a multiple of patch*merge=28 within the pixel budget, CLIP-normalize, then patchify
-into the temporal/spatial-merge-grouped layout the ViT expects. Verified equal to
-HF's processor (scripts/proto_custom_preprocess.py).
+PIL 图 -> (pixel_values [num_patches, 1176], grid_thw [1, 3])。在像素预算内 smart-resize
+到 patch*merge=28 的倍数,做 CLIP 归一化,再 patchify 成 ViT 需要的「时间/空间合并分组」
+布局。和 HF processor 验证一致。
 """
 
 from __future__ import annotations
@@ -48,7 +47,7 @@ def preprocess_image(img: Image.Image):
     arr = (arr - CLIP_MEAN) / CLIP_STD
     arr = arr.transpose(2, 0, 1)                          # [3, rh, rw]
 
-    # repeat the single frame to temporal_patch_size, then patchify
+    # 把单帧重复成 temporal_patch_size 帧,再 patchify
     patches = np.repeat(arr[np.newaxis], TEMPORAL_PATCH, axis=0)  # [T, 3, rh, rw]
     gt, gh, gw = 1, rh // PATCH_SIZE, rw // PATCH_SIZE
     patches = patches.reshape(

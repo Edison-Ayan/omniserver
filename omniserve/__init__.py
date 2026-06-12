@@ -1,7 +1,7 @@
-"""omniserve — a lightweight multimodal LLM inference engine.
+"""omniserve —— 一个轻量的多模态 LLM 推理引擎。
 
-Public surface kept small on purpose; the interesting parts are the scheduler
-(continuous batching) and the model runner (KV cache + vision embedding cache).
+对外暴露的接口刻意保持精简;有意思的部分是调度器(continuous batching)和
+model runner(KV cache + vision embedding cache)。
 """
 
 from .engine import LLMEngine, StepDelta
@@ -24,7 +24,7 @@ __all__ = [
 
 
 def __getattr__(name):
-    # Lazy import so the control plane stays importable without torch/transformers.
+    # 懒加载,这样没装 torch/transformers 也能 import 控制平面。
     if name == "QwenVLRunner":
         from .runners.qwen_vl import QwenVLRunner
         return QwenVLRunner

@@ -1,9 +1,8 @@
-"""Native Qwen2-VL runner — zero transformers dependency.
+"""原生 Qwen2-VL runner —— 零 transformers 依赖。
 
-Drives our own everything: tokenizer (`tokenizers` lib), image preprocessing,
-ViT, M-RoPE positions, and LLM forward, with the preallocated KV pool. Weights
-are read straight from the safetensors shards. The only third-party pieces left
-are PyTorch (compute), `tokenizers` (BPE), `safetensors` (loading) and PIL.
+驱动全套自写实现:tokenizer(`tokenizers` 库)、图像预处理、ViT、M-RoPE 位置、
+LLM forward,配合预分配 KV 池。权重直接从 safetensors 分片读。剩下的第三方只有
+PyTorch(计算)、`tokenizers`(BPE)、`safetensors`(加载)和 PIL。
 """
 
 from __future__ import annotations

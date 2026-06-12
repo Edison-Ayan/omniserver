@@ -1,22 +1,18 @@
-"""Model execution backend.
+"""模型执行后端。
 
-The runner is the only component that touches tensors / the GPU. It exposes two
-operations to the engine:
+runner 是唯一碰张量 / GPU 的组件。它给引擎暴露两个操作:
 
-    prefill(seqs)  -> for each new sequence, encode the prompt (text + images),
-                      run the model once, populate its KV cache, emit 1st token.
-    decode(seqs)   -> for each running sequence, run a single-token forward using
-                      its cached KV state, emit the next token.
+    prefill(seqs)  -> 对每个新序列,编码 prompt(文本+图像),跑一次模型,
+                      填好它的 KV cache,吐出第一个 token。
+    decode(seqs)   -> 对每个在跑的序列,用它缓存的 KV 状态做单 token 前向,
+                      吐出下一个 token。
 
-`ModelRunner` is the abstract interface so the engine stays backend-agnostic.
-`QwenVLRunner` is the concrete Qwen2-VL implementation. The vision embedding
-cache plugs in at prefill time (image -> vision tokens) and is the project's
-differentiating optimization.
+`ModelRunner` 是抽象接口,让引擎与后端无关。`QwenVLRunner` 是具体的 Qwen2-VL 实现。
+vision embedding cache 在 prefill 时接入(图 -> vision token),是本项目的差异化优化。
 
-NOTE: the Qwen2-VL KV-cache wiring (DynamicCache per sequence, batched decode
-with left-padding) is the part that must be validated on the GPU. It is staged
-here with a clear contract; the engine and scheduler above are already complete
-and testable against the StubRunner.
+注意:Qwen2-VL 的 KV-cache 接线(每序列一个 DynamicCache、左 padding 的批量 decode)
+是必须在 GPU 上验证的部分。这里先按清晰的契约搭好;上面的引擎和调度器已经完整,
+可以用 StubRunner 测试。
 """
 
 from __future__ import annotations
@@ -30,31 +26,30 @@ from ..request import Sequence
 class ModelRunner(abc.ABC):
     @abc.abstractmethod
     def tokenize(self, seq: Sequence) -> None:
-        """Fill seq.prompt_token_ids from the request prompt (+ image placeholders)."""
+        """从请求 prompt(+ 图像占位符)填好 seq.prompt_token_ids。"""
 
     @abc.abstractmethod
     def prefill(self, seqs: List[Sequence]) -> None:
-        """Run prompt prefill for each seq; append the first generated token and
-        store the KV handle on the sequence."""
+        """对每个 seq 做 prompt prefill;追加第一个生成 token,并在序列上存好 KV 句柄。"""
 
     @abc.abstractmethod
     def decode(self, seqs: List[Sequence]) -> None:
-        """Advance each running seq by exactly one token using its KV handle."""
+        """用每个在跑序列的 KV 句柄,把它前进恰好一个 token。"""
 
     @abc.abstractmethod
     def detokenize(self, seq: Sequence, new_token_ids: List[int]) -> str:
-        """Render newly produced token ids to text for streaming."""
+        """把新产生的 token id 渲染成文本,用于流式输出。"""
 
     def free(self, seq: Sequence) -> None:
-        """Release any resources (e.g. a KV-cache slot) held by a finished
-        sequence. Default no-op; backends with a preallocated pool override it."""
+        """释放跑完序列占用的资源(比如一个 KV-cache 槽位)。默认空操作;
+        有预分配池的后端会重写它。"""
 
 
 class StubRunner(ModelRunner):
-    """No-GPU runner that lets us exercise the scheduler/engine end to end.
+    """无 GPU 的 runner,让我们能端到端地跑通调度器/引擎。
 
-    Emits a deterministic canned response so the control plane (batching,
-    streaming, retirement) can be tested before the real model is wired in.
+    吐固定的、确定性的假回复,这样在真模型接上之前就能测控制平面
+    (batching、流式、退休)。
     """
 
     def __init__(self, reply: str = "ok " * 8):

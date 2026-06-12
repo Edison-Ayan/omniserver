@@ -1,8 +1,8 @@
-"""Model execution backends for the engine.
+"""引擎的模型执行后端。
 
-`base` defines the `ModelRunner` interface and a no-GPU `StubRunner`.
-Concrete model runners (e.g. `QwenVLRunner`) live alongside it and are imported
-lazily so the control plane stays importable without torch/transformers.
+`base` 定义了 `ModelRunner` 接口和无 GPU 的 `StubRunner`。
+具体的 model runner(比如 `QwenVLRunner`)放在旁边,并且懒加载,
+这样没装 torch/transformers 也能 import 控制平面。
 """
 
 from .base import ModelRunner, StubRunner

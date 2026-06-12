@@ -1,7 +1,7 @@
-"""Hand-written fused kernels (Triton) for the model's hot pointwise ops.
+"""为模型热点逐元素算子手写的融合 kernel(Triton)。
 
-`rmsnorm` provides a fused RMSNorm kernel and `patch_llm_rmsnorm` to swap it into
-the language-model stack in place of transformers' Qwen2RMSNorm.
+`rmsnorm` 提供融合的 RMSNorm kernel,以及 `patch_llm_rmsnorm`,把它替换进
+语言模型栈、顶掉 transformers 的 Qwen2RMSNorm。
 """
 
 from .rmsnorm import FusedRMSNorm, patch_llm_rmsnorm, rmsnorm

@@ -1,10 +1,9 @@
-"""The inference engine: drives the scheduler/runner step loop.
+"""推理引擎:驱动「调度器 / runner」的步进循环。
 
-One `step()` is one iteration of continuous batching:
-    schedule -> prefill new seqs + decode running seqs -> retire finished.
+一次 `step()` 就是一轮 continuous batching:
+    调度 -> prefill 新序列 + decode 在跑的序列 -> 退休跑完的。
 
-Per-step it returns the increments produced by each sequence so the server can
-stream tokens to clients as soon as they are generated.
+每一步返回各序列新产生的增量,这样 server 可以一生成就把 token 流式发给客户端。
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ from .scheduler import Scheduler, SchedulerConfig
 
 @dataclass
 class StepDelta:
-    """Per-sequence output produced in one step, for streaming back to clients."""
+    """一步里某个序列产生的输出增量,用于流式回传客户端。"""
     request_id: str
     text: str
     finished: bool
@@ -30,8 +29,7 @@ class LLMEngine:
         self.runner = runner
         self.scheduler = Scheduler(sched_config or SchedulerConfig())
         self._seqs: Dict[str, Sequence] = {}
-        # retains every sequence ever submitted (finished ones are pruned from
-        # _seqs); handy for end-of-run metrics.
+        # 保留提交过的所有序列(跑完的会从 _seqs 里清掉);跑完后统计指标时方便。
         self._history: Dict[str, Sequence] = {}
 
     def add_request(self, request: Request) -> str:
@@ -43,7 +41,7 @@ class LLMEngine:
         return seq.request_id
 
     def sequences(self):
-        """All sequences submitted to this engine (running + finished)."""
+        """提交给本引擎的所有序列(在跑的 + 跑完的)。"""
         return list(self._history.values())
 
     def abort(self, request_id: str) -> None:
@@ -61,7 +59,7 @@ class LLMEngine:
         if out.decode:
             self.runner.decode(out.decode)
 
-        # Collect newly streamed tokens from every sequence touched this step.
+        # 收集本步动过的每个序列新流出的 token。
         for seq in (*out.prefill, *out.decode):
             new_ids = seq.output_token_ids[seq.num_streamed:]
             if new_ids:
@@ -69,8 +67,8 @@ class LLMEngine:
                 seq.num_streamed = seq.num_output_tokens
                 deltas.append(StepDelta(seq.request_id, text, seq.status != Status.RUNNING))
 
-        # Release finished sequences: tell the runner to free their KV slot
-        # (it compacts its preallocated pool), then drop them from the registry.
+        # 释放跑完的序列:让 runner 回收它们的 KV 槽位(它会紧凑化预分配池),
+        # 再从注册表里删掉。
         for seq in self.scheduler.free_finished():
             self.runner.free(seq)
             self._seqs.pop(seq.request_id, None)
@@ -78,7 +76,7 @@ class LLMEngine:
         return deltas
 
     def run_until_complete(self) -> Dict[str, str]:
-        """Synchronous helper for offline/batch use and tests."""
+        """离线/批量使用和测试用的同步辅助方法。"""
         texts: Dict[str, List[str]] = {rid: [] for rid in self._seqs}
         while self.has_unfinished():
             for d in self.step():

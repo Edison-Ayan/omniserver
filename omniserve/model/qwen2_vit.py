@@ -1,11 +1,11 @@
-"""From-scratch Qwen2-VL vision encoder (ViT), matching HF.
+"""从零实现的 Qwen2-VL 视觉编码器(ViT),和 HF 对齐。
 
-Removes the last big transformers dependency on the perf path. Architecture:
-patch embed (Conv3d over 2x14x14 patches) -> 32 blocks (LayerNorm, QKV attn with
-2-D rotary applied per (h,w) patch position, quick-GELU MLP) -> patch merger
-(group spatial_merge_size^2 neighbours, MLP) -> hidden_size 1536.
+拿掉了性能路径上最后一个大的 transformers 依赖。架构:
+patch embed(对 2x14x14 patch 做 Conv3d)-> 32 个 block(LayerNorm,QKV 注意力 +
+按 (h,w) patch 位置应用的 2D rotary,quick-GELU MLP)-> patch merger(把
+spatial_merge_size^2 个相邻 patch 合并,过 MLP)-> hidden_size 1536。
 
-Verified output-identical to HF's `model.visual` (scripts/proto_custom_vit.py).
+输出和 HF 的 `model.visual` 逐 bit 一致(scripts/proto_custom_vit.py 验证)。
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ class VisionBlock(nn.Module):
         qkv = self.attn_qkv(x).reshape(S, 3, self.n_heads, self.hd).permute(1, 0, 2, 3)
         q, k, v = qkv[0], qkv[1], qkv[2]            # [S, nh, hd]
         q, k = apply_rotary_vision(q, k, cos, sin)
-        # full attention within each image segment (cu_seqlens delimits images)
+        # 每张图段内部做全注意力(cu_seqlens 划分各张图)
         outs = []
         for i in range(len(cu_seqlens) - 1):
             a, b = cu_seqlens[i], cu_seqlens[i + 1]
@@ -87,8 +87,7 @@ class Qwen2VIT(nn.Module):
         self.merger_fc2 = nn.Linear(merged, out_hidden, bias=True)
         self._merged = merged
         self._in = (in_chans, temporal_patch_size, patch_size)
-        # rotary freqs must stay fp32 — .half() on the module would lose precision
-        # and the error compounds across the 32 blocks.
+        # rotary 频率必须保持 fp32——对模块 .half() 会丢精度,误差会在 32 层里累积放大。
         self._rot_dim = (embed_dim // n_heads) // 2
         self._rope_theta = rope_theta
 

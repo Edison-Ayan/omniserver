@@ -8,6 +8,10 @@ vision-embedding cache, built to run a vision-language model (Qwen2-VL-2B) on a
 > scheduling, KV-cache management, and multimodal-specific optimizations — in a
 > small, readable codebase rather than reproducing a production framework.
 
+📈 **[OPTIMIZATION.md](OPTIMIZATION.md)** — the profile-first journey from 0.18x
+to 0.44x of vLLM, what was deliberately *not* done (and why), and where the
+remaining gap is.
+
 ## Why
 Multimodal serving has a cost that text-only serving does not: the vision
 encoder (ViT) re-runs for every request, and identical images (multi-turn chat,

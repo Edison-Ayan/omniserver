@@ -77,6 +77,54 @@ but **+1% end-to-end** — RMSNorm is memory-bound yet a small slice of total ti
 A clean illustration of Amdahl's law: a fast kernel on a small fraction barely
 moves the needle.
 
+## 5. Full layer-kernel fusion (vLLM-style) — e2e +2%
+
+Once the forward was our own (`omniserve/model/qwen2_llm.py`), we replicated
+vLLM's in-layer fusions: **fused QKV** (q/k/v into one GEMM, split after), **fused
+gate_up** (one GEMM), **fused SiLU×Mul** (Triton), and **residual-carried
+fused add+RMSNorm** (Triton, the add folded into the norm — vLLM never writes an
+explicit `x = x + ...`). All token-identical. End-to-end: **+2%** (216 → 221 tok/s).
+Amdahl again — see the nsys breakdown below for why.
+
+## Why vLLM is fast — the compounding chain (nsys evidence)
+
+We profiled both engines' decode with Nsight Systems (`scripts/prof_decode.py`,
+`scripts/prof_vllm_decode.py`). The kernels differ in exactly the places that matter:
+
+| function | omniserve | vLLM (nsys) |
+|---|---|---|
+| decode attention | SDPA `fmha_cutlassF` + `repeat_interleave` to **materialize GQA KV (18.8%)** | **`flash_fwd_splitkv`** (FlashAttention decode, GQA-native, no materialization) |
+| RoPE | PyTorch elementwise chain | `rotary_kernel` (fused) |
+| SiLU×Mul | our Triton `_silu_mul_fwd` | `vllm::act_and_mul_kernel` |
+| QKV / gate_up | fused (after §5) | fused |
+
+omniserve's decode GPU time: **GEMM 55% + attention 20% + elementwise 19%** (the
+19% is mostly the GQA KV materialization) + our fused kernels ~1%.
+
+**The key is that it compounds.** A standalone data point: vLLM with `enforce_eager`
+(no CUDA graphs) does **293 tok/s**; with CUDA graphs, **503 tok/s** — graphs alone
+are **1.7x**. Yet on omniserve we measured CUDA graphs as *useless* (§ below). The
+resolution:
+
+> Fast kernels (FlashAttention + fused) make each step's GPU time **short enough
+> that kernel launch becomes the bottleneck** → the engine is *launch-bound* → CUDA
+> graphs erase that launch overhead → +1.7x. omniserve's slower kernels (SDPA + KV
+> materialization) keep each step **GPU-bound**, so the CPU already keeps up and
+> graphs do nothing.
+
+So vLLM's speed is a chain where each link enables the next:
+
+1. **FlashAttention** — GQA-native (kills the 19% KV materialization) and faster than SDPA;
+2. **fused CUDA kernels** (rotary, act_and_mul, QKV/gate_up) — shrink GPU time further;
+3. **1 + 2 ⇒ launch-bound ⇒ CUDA graphs** add 1.7x;
+4. **PagedAttention** — no KV waste ⇒ larger batches ⇒ weight reads amortized further.
+
+omniserve is stuck at **link 1**: SDPA can't give GQA-native *and* fast (we tried
+`enable_gqa` — slower, see below), so the KV materialization stays, the step is
+GPU-bound, and the whole compounding chain never starts. The first link,
+FlashAttention, is precisely what requires a custom CUDA kernel that the HF/SDPA
+stack does not provide — which is why the remaining gap lives at the kernel layer.
+
 ---
 
 ## Things deliberately NOT done (and why)
@@ -88,6 +136,14 @@ After preallocation, a back-to-back (no-sync) decode loop ran at the same speed
 as a synced one (ratio **1.02**) → the step is now **GPU-bound, not launch-bound**.
 CUDA graphs remove launch/CPU overhead; there is none left to remove. (Before the
 pool, at 15k launches, it would have helped — the pool moved the bottleneck.)
+
+### SDPA `enable_gqa` to drop the KV materialization — measured *slower*
+nsys flagged the GQA `repeat_interleave` (materializing `[B,2,L,D]→[B,12,L,D]`
+each layer) as 19% of decode. The obvious fix — `F.scaled_dot_product_attention(
+..., enable_gqa=True)`, which broadcasts the 2 KV heads in-kernel — made decode
+**slower** (40 vs 30 ms/step): it forces SDPA off the fast `fmha` path onto the
+math backend. *Materialize + fast kernel* beats *broadcast + slow kernel*. Getting
+both (GQA-native *and* fast) needs FlashAttention — vLLM's moat, not in SDPA.
 
 ### bitsandbytes 4-bit — measured *slower* than fp16 for decode
 Decode is **memory-bandwidth-bound on weight loading** (fp16 2B weights ≈ 4.4 GB
@@ -115,8 +171,9 @@ different fp16 kernel, is the Ada-specific lever for bandwidth-bound decode.
 | quantized GEMM kernel (decode-dominant) | Marlin / FP8 fused | fp16 / bnb (slower) | hard — needs Marlin or an FP8 path |
 | sequential prefill (~48% of time) | chunked/batched | one-at-a-time | medium |
 | paged attention | dedicated kernel | preallocated pool (most of the win) | mostly done |
-| fully fused kernels (QKV/RoPE/MLP) | yes | RMSNorm only | medium, small payoff |
-| lean C++ forward | yes | HF Python forward | hard — a rewrite |
+| fused attention (FlashAttention, GQA-native) | yes | SDPA + KV materialization | hard — custom kernel, the chain's first link |
+| in-layer fused kernels (QKV/gate_up/SiLU/add+norm) | yes | **done (§5)** — but +2% (Amdahl) | — |
+| lean C++ forward | yes | our Python forward | hard — a rewrite |
 
 The character of the gap changed over this work: it started as **self-inflicted
 inefficiency** (O(L²) KV rebuild, launch storms) that was fixable, and now is

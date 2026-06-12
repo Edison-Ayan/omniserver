@@ -21,9 +21,10 @@ MERGE_SIZE = 2
 class Qwen2VLTokenizer:
     def __init__(self, tokenizer_json_path: str):
         self.tok = Tokenizer.from_file(tokenizer_json_path)
-        # tokenizer.json ships ids up to 151654; image/video pad live in
-        # tokenizer_config.json (which the raw library doesn't read). Append them
-        # in id order so they land on 151655 / 151656.
+        # 踩坑:tokenizer.json 只到 id 151654,<|image_pad|>(151655)/<|video_pad|>
+        # 在 tokenizer_config.json 的 added_tokens_decoder 里(transformers 会读,
+        # raw tokenizers 库不读)。必须手动补,且按 id 顺序加才能落到 151655/151656,
+        # 否则 image_pad 会被当字面字符拆开,input_ids 完全对不上。
         if self.tok.token_to_id(IMAGE_PAD) is None:
             self.tok.add_special_tokens([
                 AddedToken("<|image_pad|>", special=True),

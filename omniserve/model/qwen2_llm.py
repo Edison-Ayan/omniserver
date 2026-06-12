@@ -153,6 +153,8 @@ def load_from_hf(model: Qwen2LLM, hf_state_dict: dict) -> None:
     the raw safetensors layout (`model.layers...`) and the loaded-model layout
     (`model.language_model.layers...`)."""
     sd = hf_state_dict
+    # 踩坑:raw safetensors 用 `model.layers.` 前缀,而 transformers 加载后的
+    # state_dict() 是 `model.language_model.layers.`(新版重构了结构)。两种都支持。
     P = "model.language_model." if "model.language_model.embed_tokens.weight" in sd else "model."
     model.embed_tokens.weight.data.copy_(sd[P + "embed_tokens.weight"])
     model.norm.weight.data.copy_(sd[P + "norm.weight"])

@@ -28,6 +28,10 @@ import time
 import uuid
 from typing import List, Tuple
 
+# 踩坑:本文件用了 `from __future__ import annotations`,类型注解会变成字符串,
+# FastAPI 解析 handler 的 `HTTPRequest` 注解时只在「模块全局」里找。所以这些
+# fastapi 导入必须放模块级——放在 build_app() 内部(局部)会导致 FastAPI 解析不到
+# Request 类型,把它当成 query 参数,请求直接 422。
 from fastapi import FastAPI
 from fastapi import Request as HTTPRequest
 from fastapi.responses import JSONResponse, StreamingResponse

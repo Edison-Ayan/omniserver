@@ -103,8 +103,9 @@ class Qwen2VIT(nn.Module):
             pos_ids.append(torch.stack([hp, wp], dim=-1).repeat(t, 1))
         pos_ids = torch.cat(pos_ids, dim=0).to(device)
         max_grid = int(grid_thw[:, 1:].max())
-        # compute inv_freq on CPU in fp32 (matches HF's buffer init bit-for-bit;
-        # the fp16 ViT chain is chaotic so even ULP cos diffs compound)
+        # 踩坑:inv_freq 必须在 CPU 上用 fp32 算。一开始在 GPU 上算,和 HF 在 CPU
+        # 初始化差了 ~9.4e-7(ULP 级),这个微小差异被 32 层 fp16 残差链指数放大成
+        # 2.5 的输出误差。改成 CPU+fp32 后整个 ViT 和 HF bit 级一致(误差 0.0)。
         inv_freq = (1.0 / (self._rope_theta ** (
             torch.arange(0, self._rot_dim, 2, dtype=torch.float32) / self._rot_dim))).to(device)
         seq = torch.arange(max_grid, device=device, dtype=torch.float32)
@@ -118,7 +119,8 @@ class Qwen2VIT(nn.Module):
         c, tp, ps = self._in
         x = pixel_values.view(-1, c, tp, ps, ps).to(self.patch_embed.weight.dtype)
         x = self.patch_embed(x).view(-1, self.embed_dim)
-        cos, sin = self._rot_pos_emb(grid_thw, x.device)  # keep fp32, like HF
+        # 踩坑:cos/sin 全程保持 fp32(不要 .to(fp16)),否则同样会在深层链放大
+        cos, sin = self._rot_pos_emb(grid_thw, x.device)
         cu = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(0)
         cu = F.pad(cu, (1, 0), value=0).to(torch.int32)
         for blk in self.blocks:

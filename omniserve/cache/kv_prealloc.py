@@ -21,6 +21,10 @@ import torch
 
 
 class PreallocatedKVCache:
+    # 经验:cat-based 的 DynamicCache 每步 torch.cat 把整段 KV 拷一遍(每步 O(L),
+    # 整条 O(L²)),profile 显示 decode 单步发了 ~15000 个 kernel,大头是这些 copy/cat。
+    # 改成预分配固定 buffer + 原地 scatter 写入后,kernel 数降到 ~3100,decode +15%,
+    # 而且把瓶颈从 launch-bound 推到了 GPU-bound(详见 OPTIMIZATION.md)。
     def __init__(self, n_layers: int, max_batch: int, n_kv_heads: int,
                  max_len: int, head_dim: int, device, dtype):
         self.n_layers = n_layers

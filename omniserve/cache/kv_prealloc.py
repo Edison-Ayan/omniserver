@@ -54,6 +54,25 @@ class PreallocatedKVCache:
         """Return a cache view bound to the first `n` active slots for a forward."""
         return _CacheView(self, n)
 
+    def prefill_cache(self, slot: int):
+        """Cache adapter for the native forward to write one sequence's prefill
+        KV into `slot` (cache.update(k, v, layer_idx) convention)."""
+        return _PrefillWriter(self, slot)
+
+
+class _PrefillWriter:
+    def __init__(self, pool: PreallocatedKVCache, slot: int):
+        self.pool, self.slot = pool, slot
+
+    def update(self, k, v, layer_idx):
+        # k, v: [1, n_kv_heads, L, head_dim] (rope already applied by the caller)
+        L = k.shape[2]
+        self.pool.k[layer_idx][self.slot, :, :L, :] = k[0]
+        self.pool.v[layer_idx][self.slot, :, :L, :] = v[0]
+        if layer_idx == self.pool.n_layers - 1:
+            self.pool.lengths[self.slot] = L
+        return k, v  # prefill attends to its own K/V
+
 
 class _CacheView:
     """A per-forward adapter passed as `past_key_values`. `update` writes the new

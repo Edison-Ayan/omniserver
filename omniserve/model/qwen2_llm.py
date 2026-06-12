@@ -77,14 +77,14 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(self.nh * self.hd, cfg.hidden_size, bias=False)
         self.mrope_section = cfg.mrope_section
 
-    def forward(self, x, cos, sin, attn_mask, past=None):
+    def forward(self, x, cos, sin, attn_mask, cache=None, layer_idx=0):
         B, L, _ = x.shape
         q = self.q_proj(x).view(B, L, self.nh, self.hd).transpose(1, 2)
         k = self.k_proj(x).view(B, L, self.nkv, self.hd).transpose(1, 2)
         v = self.v_proj(x).view(B, L, self.nkv, self.hd).transpose(1, 2)
         q, k = apply_mrope(q, k, cos, sin, self.mrope_section)
-        if past is not None:
-            k, v = past.update(k, v)          # returns the full K/V window
+        if cache is not None:
+            k, v = cache.update(k, v, layer_idx)   # returns the full K/V window
         # GQA: expand KV heads to match query heads
         rep = self.nh // self.nkv
         k = k.repeat_interleave(rep, dim=1)
@@ -113,8 +113,8 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = MLP(cfg)
 
-    def forward(self, x, cos, sin, attn_mask, past=None):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, attn_mask, past)
+    def forward(self, x, cos, sin, attn_mask, cache=None, layer_idx=0):
+        x = x + self.self_attn(self.input_layernorm(x), cos, sin, attn_mask, cache, layer_idx)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -127,6 +127,7 @@ class Qwen2LLM(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer(cfg) for _ in range(cfg.num_layers)])
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_size, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight  # tied (saves ~0.5 GB)
         inv_freq = 1.0 / (cfg.rope_theta ** (torch.arange(0, cfg.head_dim, 2).float() / cfg.head_dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
@@ -137,13 +138,12 @@ class Qwen2LLM(nn.Module):
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos(), emb.sin()
 
-    def forward(self, inputs_embeds, position_ids, attn_mask, caches=None):
+    def forward(self, inputs_embeds, position_ids, attn_mask, cache=None):
         cos, sin = self.rope(position_ids)
         cos, sin = cos.to(inputs_embeds.dtype), sin.to(inputs_embeds.dtype)
         h = inputs_embeds
         for i, layer in enumerate(self.layers):
-            past = caches[i] if caches is not None else None
-            h = layer(h, cos, sin, attn_mask, past)
+            h = layer(h, cos, sin, attn_mask, cache, i)
         h = self.norm(h)
         return self.lm_head(h)
 
@@ -154,9 +154,7 @@ def load_from_hf(model: Qwen2LLM, hf_state_dict: dict) -> None:
     sd = hf_state_dict
     model.embed_tokens.weight.data.copy_(sd[P + "embed_tokens.weight"])
     model.norm.weight.data.copy_(sd[P + "norm.weight"])
-    # tied embeddings: lm_head shares embed_tokens unless a separate weight exists
-    lm = sd.get("lm_head.weight", sd[P + "embed_tokens.weight"])
-    model.lm_head.weight.data.copy_(lm)
+    # lm_head is tied to embed_tokens (same tensor), so it's already loaded
     for i, layer in enumerate(model.layers):
         lp = f"{P}layers.{i}."
         a = layer.self_attn

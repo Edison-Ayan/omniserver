@@ -42,11 +42,13 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        dtype = x.dtype
-        x = x.float()
-        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-        return self.weight * x.to(dtype)
+    def forward(self, x, residual=None):
+        # 用融合 Triton kernel:无残差 -> rms_norm;有残差 -> add_rms_norm
+        # (残差 add 折进 norm,返回 (normed, new_residual))。
+        from ..kernels.fused_ops import add_rms_norm, rms_norm
+        if residual is None:
+            return rms_norm(x, self.weight, self.eps)
+        return add_rms_norm(x, residual, self.weight, self.eps)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -69,21 +71,27 @@ class Attention(nn.Module):
     def __init__(self, cfg: Qwen2Config):
         super().__init__()
         self.nh, self.nkv, self.hd = cfg.num_heads, cfg.num_kv_heads, cfg.head_dim
-        self.q_proj = nn.Linear(cfg.hidden_size, self.nh * self.hd, bias=True)
-        self.k_proj = nn.Linear(cfg.hidden_size, self.nkv * self.hd, bias=True)
-        self.v_proj = nn.Linear(cfg.hidden_size, self.nkv * self.hd, bias=True)
+        self.q_size = self.nh * self.hd
+        self.kv_size = self.nkv * self.hd
+        # 融合 QKV:q/k/v 合成一个 GEMM(照搬 vLLM 的 QKVParallelLinear),算完 split
+        self.qkv_proj = nn.Linear(cfg.hidden_size, self.q_size + 2 * self.kv_size, bias=True)
         self.o_proj = nn.Linear(self.nh * self.hd, cfg.hidden_size, bias=False)
         self.mrope_section = cfg.mrope_section
 
     def forward(self, x, cos, sin, attn_mask, cache=None, layer_idx=0):
         B, L, _ = x.shape
-        q = self.q_proj(x).view(B, L, self.nh, self.hd).transpose(1, 2)
-        k = self.k_proj(x).view(B, L, self.nkv, self.hd).transpose(1, 2)
-        v = self.v_proj(x).view(B, L, self.nkv, self.hd).transpose(1, 2)
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q = q.view(B, L, self.nh, self.hd).transpose(1, 2)
+        k = k.view(B, L, self.nkv, self.hd).transpose(1, 2)
+        v = v.view(B, L, self.nkv, self.hd).transpose(1, 2)
         q, k = apply_mrope(q, k, cos, sin, self.mrope_section)
         if cache is not None:
             k, v = cache.update(k, v, layer_idx)   # 返回完整的 K/V 窗口
-        # GQA:把 KV 头扩展到和 query 头数对齐
+        # GQA:把 KV 头物化扩到 query 头数。nsys 显示这个 repeat_interleave 占 decode
+        # ~19%,但实测换成 SDPA enable_gqa(不物化、kernel 内广播)反而更慢——因为那会
+        # 让 SDPA 放弃快的 fmha kernel、回退到慢的 math 后端。物化+快kernel > 广播+慢kernel。
+        # 想两全(GQA-aware 且快)需要 FlashAttention,SDPA 给不了——这正是 vLLM 的护城河。
         rep = self.nh // self.nkv
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)
@@ -95,12 +103,13 @@ class Attention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, cfg: Qwen2Config):
         super().__init__()
-        self.gate_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(cfg.hidden_size, cfg.intermediate_size, bias=False)
+        # 融合 gate+up:合成一个 GEMM(照搬 vLLM 的 MergedColumnParallelLinear)
+        self.gate_up_proj = nn.Linear(cfg.hidden_size, 2 * cfg.intermediate_size, bias=False)
         self.down_proj = nn.Linear(cfg.intermediate_size, cfg.hidden_size, bias=False)
 
     def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+        from ..kernels.fused_ops import silu_mul
+        return self.down_proj(silu_mul(self.gate_up_proj(x)))   # silu(gate)*up 一个 kernel
 
 
 class DecoderLayer(nn.Module):
@@ -111,10 +120,17 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.mlp = MLP(cfg)
 
-    def forward(self, x, cos, sin, attn_mask, cache=None, layer_idx=0):
-        x = x + self.self_attn(self.input_layernorm(x), cos, sin, attn_mask, cache, layer_idx)
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x
+    def forward(self, x, residual, cos, sin, attn_mask, cache=None, layer_idx=0):
+        # 残差穿层传递(照搬 vLLM):add 折进 RMSNorm,层内不写显式的 x = x + ...
+        if residual is None:
+            residual = x
+            x = self.input_layernorm(x)
+        else:
+            x, residual = self.input_layernorm(x, residual)
+        x = self.self_attn(x, cos, sin, attn_mask, cache, layer_idx)
+        x, residual = self.post_attention_layernorm(x, residual)
+        x = self.mlp(x)
+        return x, residual
 
 
 class Qwen2LLM(nn.Module):
@@ -140,9 +156,10 @@ class Qwen2LLM(nn.Module):
         cos, sin = self.rope(position_ids)
         cos, sin = cos.to(inputs_embeds.dtype), sin.to(inputs_embeds.dtype)
         h = inputs_embeds
+        residual = None
         for i, layer in enumerate(self.layers):
-            h = layer(h, cos, sin, attn_mask, cache, i)
-        h = self.norm(h)
+            h, residual = layer(h, residual, cos, sin, attn_mask, cache, i)
+        h, _ = self.norm(h, residual)   # 最终 norm 折进最后一次残差 add
         return self.lm_head(h)
 
 
@@ -159,12 +176,17 @@ def load_from_hf(model: Qwen2LLM, hf_state_dict: dict) -> None:
     for i, layer in enumerate(model.layers):
         lp = f"{P}layers.{i}."
         a = layer.self_attn
-        for name, mod in [("q_proj", a.q_proj), ("k_proj", a.k_proj), ("v_proj", a.v_proj)]:
-            mod.weight.data.copy_(sd[lp + f"self_attn.{name}.weight"])
-            mod.bias.data.copy_(sd[lp + f"self_attn.{name}.bias"])
+        # 融合 QKV:把 q/k/v 的权重和 bias 沿输出维 concat 进一个 qkv_proj
+        a.qkv_proj.weight.data.copy_(torch.cat([
+            sd[lp + "self_attn.q_proj.weight"], sd[lp + "self_attn.k_proj.weight"],
+            sd[lp + "self_attn.v_proj.weight"]], dim=0))
+        a.qkv_proj.bias.data.copy_(torch.cat([
+            sd[lp + "self_attn.q_proj.bias"], sd[lp + "self_attn.k_proj.bias"],
+            sd[lp + "self_attn.v_proj.bias"]], dim=0))
         a.o_proj.weight.data.copy_(sd[lp + "self_attn.o_proj.weight"])
-        layer.mlp.gate_proj.weight.data.copy_(sd[lp + "mlp.gate_proj.weight"])
-        layer.mlp.up_proj.weight.data.copy_(sd[lp + "mlp.up_proj.weight"])
+        # 融合 gate+up:concat 进一个 gate_up_proj(gate 在前、up 在后)
+        layer.mlp.gate_up_proj.weight.data.copy_(torch.cat([
+            sd[lp + "mlp.gate_proj.weight"], sd[lp + "mlp.up_proj.weight"]], dim=0))
         layer.mlp.down_proj.weight.data.copy_(sd[lp + "mlp.down_proj.weight"])
         layer.input_layernorm.weight.data.copy_(sd[lp + "input_layernorm.weight"])
         layer.post_attention_layernorm.weight.data.copy_(sd[lp + "post_attention_layernorm.weight"])

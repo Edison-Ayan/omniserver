@@ -18,6 +18,9 @@ third-party pieces are PyTorch (compute), `tokenizers` (BPE), `safetensors`
 to 0.44x of vLLM, what was deliberately *not* done (and why), and where the
 remaining gap is.
 
+🚀 **[运行流程.md](运行流程.md)** — 环境准备、三种启动方式(库 / OpenAI server /
+benchmark)、以及一个请求从提交到流式返回的完整运行流程(中文)。
+
 ## Why
 Multimodal serving has a cost that text-only serving does not: the vision
 encoder (ViT) re-runs for every request, and identical images (multi-turn chat,

@@ -149,9 +149,11 @@ class Qwen2LLM(nn.Module):
 
 
 def load_from_hf(model: Qwen2LLM, hf_state_dict: dict) -> None:
-    """Copy weights from a Qwen2VL HF state_dict into the custom model."""
-    P = "model.language_model."
+    """Copy weights from a Qwen2VL state_dict into the custom model. Handles both
+    the raw safetensors layout (`model.layers...`) and the loaded-model layout
+    (`model.language_model.layers...`)."""
     sd = hf_state_dict
+    P = "model.language_model." if "model.language_model.embed_tokens.weight" in sd else "model."
     model.embed_tokens.weight.data.copy_(sd[P + "embed_tokens.weight"])
     model.norm.weight.data.copy_(sd[P + "norm.weight"])
     # lm_head is tied to embed_tokens (same tensor), so it's already loaded

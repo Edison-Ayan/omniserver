@@ -1,59 +1,54 @@
-"""Native Qwen2-VL runner: our own LLM forward + HF's vision encoder.
+"""Native Qwen2-VL runner — zero transformers dependency.
 
-Unlike QwenVLRunner (which calls transformers' model forward), this drives the
-from-scratch `Qwen2LLM` (omniserve/model). That ownership is what later enables
-varlen/packed prefill, mixed batching and kernel fusion. The ViT is still HF's;
-its embeddings are spliced into the text embeddings.
-
-Memory: two fp16 2B models don't fit in 8 GB, so we load HF once, copy the LLM
-weights into our model, then free HF's language stack and keep only its ViT.
+Drives our own everything: tokenizer (`tokenizers` lib), image preprocessing,
+ViT, M-RoPE positions, and LLM forward, with the preallocated KV pool. Weights
+are read straight from the safetensors shards. The only third-party pieces left
+are PyTorch (compute), `tokenizers` (BPE), `safetensors` (loading) and PIL.
 """
 
 from __future__ import annotations
 
 import gc
+import glob
+import os
 from typing import Dict, List
 
 import torch
+from safetensors.torch import load_file
 
 from ..cache.kv_prealloc import PreallocatedKVCache
-from ..model import Qwen2Config, Qwen2LLM, load_from_hf
+from ..model import Qwen2Config, Qwen2LLM, Qwen2VIT, load_from_hf, load_vit_from_state_dict
+from ..model.positions import IMAGE_TOKEN_ID, mrope_position_ids
+from ..model.preprocess import preprocess_image
+from ..model.tokenizer import Qwen2VLTokenizer
 from ..request import Sequence
 from .base import ModelRunner
 
-MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
+EOS_ID = 151645  # <|im_end|>
+DEFAULT_SNAPSHOT = os.path.expanduser(
+    "~/.cache/huggingface/hub/models--Qwen--Qwen2-VL-2B-Instruct/snapshots/*")
 
 
 class NativeQwenVLRunner(ModelRunner):
-    def __init__(self, model_id: str = MODEL_ID, max_running: int = 32, max_len: int = 1024):
-        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    def __init__(self, model_dir: str = None, max_running: int = 32, max_len: int = 1024):
+        model_dir = model_dir or glob.glob(DEFAULT_SNAPSHOT)[0]
+        self.device = "cuda"
+        self.tokenizer = Qwen2VLTokenizer(os.path.join(model_dir, "tokenizer.json"))
+        self.image_token_id = IMAGE_TOKEN_ID
+        self.eos_ids = {EOS_ID}
 
-        self.processor = AutoProcessor.from_pretrained(model_id)
-        self.tokenizer = self.processor.tokenizer
-        hf = Qwen2VLForConditionalGeneration.from_pretrained(
-            model_id, dtype=torch.float16, device_map="cuda").eval()
-        self.device = hf.device
-        self.image_token_id = hf.config.image_token_id
-        self.eos_ids = {hf.config.eos_token_id}
+        sd = {}
+        for f in glob.glob(os.path.join(model_dir, "model-*.safetensors")):
+            sd.update(load_file(f))
 
-        # Copy the LLM weights to CPU, then free HF's GPU language stack (keeping
-        # only the ViT) BEFORE building our model, so the GPU never holds two full
-        # LLMs at once.
-        P = "model.language_model."
-        llm_weights = {k: v.cpu() for k, v in hf.state_dict().items()
-                       if k.startswith(P)}
-        self.visual = hf.model.visual
-        self._get_rope_index = hf.model.get_rope_index
-        hf.model.language_model = None
-        hf.lm_head = None
-        gc.collect()
-        torch.cuda.empty_cache()
+        self.vit = Qwen2VIT()
+        load_vit_from_state_dict(self.vit, sd)
+        self.vit = self.vit.half().to(self.device).eval()
 
-        # build our LLM in fp16 on CPU, load weights, then move to GPU
         self.llm = Qwen2LLM(Qwen2Config()).half()
-        load_from_hf(self.llm, llm_weights)
+        load_from_hf(self.llm, sd)
         self.llm = self.llm.to(self.device).eval()
-        del llm_weights
+        del sd
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -67,32 +62,35 @@ class NativeQwenVLRunner(ModelRunner):
     # ---- ModelRunner interface ---------------------------------------------
     def tokenize(self, seq: Sequence) -> None:
         req = seq.request
-        content = [{"type": "image"} for _ in req.images]
-        content.append({"type": "text", "text": req.prompt})
-        messages = [{"role": "user", "content": content}]
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=[text], images=req.images or None, return_tensors="pt").to(self.device)
-        seq.prompt_token_ids = inputs["input_ids"][0].tolist()
-        self._pending[seq.request_id] = inputs
+        pvs, grids = [], []
+        for im in req.images:
+            pv, grid = preprocess_image(im)
+            pvs.append(pv)
+            grids.append(grid[0])
+        input_ids = self.tokenizer.encode_prompt(req.prompt, grids)
+        ids = torch.tensor([input_ids], device=self.device)
+        pixel_values = torch.cat(pvs, 0).to(self.device).half() if pvs else None
+        grid_thw = torch.stack(grids).to(self.device) if grids else None
+        seq.prompt_token_ids = input_ids
+        self._pending[seq.request_id] = {"ids": ids, "pixel_values": pixel_values, "grid_thw": grid_thw}
         sp = seq.request.sampling
         for e in self.eos_ids:
-            if e is not None and e not in sp.stop_token_ids:
+            if e not in sp.stop_token_ids:
                 sp.stop_token_ids.append(e)
 
     @torch.inference_mode()
     def prefill(self, seqs: List[Sequence]) -> None:
         for seq in seqs:
-            inputs = self._pending.pop(seq.request_id)
-            ids = inputs["input_ids"]
+            p = self._pending.pop(seq.request_id)
+            ids = p["ids"]
             L = ids.shape[1]
-
             emb = self.llm.embed_tokens(ids).clone()
-            if inputs.get("pixel_values") is not None:
-                vis = self.visual(inputs["pixel_values"], grid_thw=inputs["image_grid_thw"])
+            if p["pixel_values"] is not None:
+                vis = self.vit(p["pixel_values"], p["grid_thw"])
                 emb[ids == self.image_token_id] = vis.to(emb.dtype)
-            pos, rope_delta = self._get_rope_index(
-                ids, inputs.get("image_grid_thw"), attention_mask=inputs.get("attention_mask"))
-            rope_delta = int(rope_delta.flatten()[0].item())
+            pos, delta = mrope_position_ids(ids, p["grid_thw"]) if p["grid_thw"] is not None \
+                else self._text_positions(ids)
+            rope_delta = int(delta.flatten()[0].item())
 
             causal = torch.full((L, L), float("-inf"), device=self.device,
                                 dtype=torch.float16).triu(1)[None, None]
@@ -105,24 +103,27 @@ class NativeQwenVLRunner(ModelRunner):
             seq.append_token(self._sample(logits, seq))
             seq.maybe_finish()
 
+    @staticmethod
+    def _text_positions(ids):
+        L = ids.shape[1]
+        pos = torch.arange(L, device=ids.device).view(1, 1, -1).expand(3, 1, -1)
+        return pos, torch.zeros(1, 1, device=ids.device)
+
     @torch.inference_mode()
     def decode(self, seqs: List[Sequence]) -> None:
         seqs = sorted(seqs, key=lambda s: s.kv_handle["slot"])
         n = len(seqs)
         assert all(seqs[b].kv_handle["slot"] == b for b in range(n))
         dev = self.device
-
         view = self._pool.view(n)
         wpos, ret = view.write_pos, view.ret_len
         ids = torch.tensor([[s.last_token_id()] for s in seqs], device=dev)
         rope = torch.tensor([s.kv_handle["rope_delta"] for s in seqs], device=dev)
         pos = torch.empty(3, n, 1, device=dev, dtype=torch.long)
         pos[:, :, 0] = (wpos + rope).unsqueeze(0)
-        # additive mask [n,1,1,ret]: row b attends to [0, wpos[b]]
         mask = torch.full((n, 1, 1, ret), float("-inf"), device=dev, dtype=torch.float16)
         for b in range(n):
             mask[b, 0, 0, : wpos[b] + 1] = 0.0
-
         emb = self.llm.embed_tokens(ids)
         logits = self.llm(emb, pos, mask, view)[:, -1, :]
         for b, seq in enumerate(seqs):
@@ -142,7 +143,7 @@ class NativeQwenVLRunner(ModelRunner):
         self._slot_seq.pop()
 
     def detokenize(self, seq: Sequence, new_token_ids: List[int]) -> str:
-        return self.tokenizer.decode(new_token_ids, skip_special_tokens=True)
+        return self.tokenizer.decode(new_token_ids)
 
     def _sample(self, logits: torch.Tensor, seq: Sequence) -> int:
         sp = seq.request.sampling

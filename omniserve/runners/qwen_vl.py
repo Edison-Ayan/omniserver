@@ -150,7 +150,7 @@ class QwenVLRunner(ModelRunner):
                     continue
 
             cache = DynamicCache()
-            self.model.model.rope_deltas = None  # force recompute for this seq
+            self.model.model.rope_deltas = None  # 强制为这个序列重算
             if self.vision_cache is not None:
                 self.vision_cache.set_pending(img_keys)
             out = self.model(

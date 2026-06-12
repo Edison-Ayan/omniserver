@@ -1,8 +1,8 @@
-"""Verify the from-scratch Qwen2 LLM forward is token-identical to HF.
+"""验证从零写的 Qwen2 LLM forward 和 HF 逐 token 一致。
 
-Reuses HF's ViT (vision embeds) and get_rope_index (positions) — only the LLM
-decoder stack is ours. Two fp16 2B models don't fit in 8 GB, so we capture HF's
-reference + inputs on CPU, free the HF model, then build and run ours.
+复用 HF 的 ViT(vision embed)和 get_rope_index(位置)——只有 LLM 解码栈是我们的。
+两个 fp16 2B 模型在 8 GB 装不下,所以把 HF 的参照 + 输入抓到 CPU,释放 HF 模型,
+再建并跑我们的。
 """
 
 import gc
@@ -39,7 +39,7 @@ def main():
     L = input_ids.shape[1]
     image_token_id = hf.config.image_token_id
 
-    # Capture HF reference + the bits we reuse, on CPU, then free the HF model.
+    # 把 HF 参照 + 要复用的东西抓到 CPU,然后释放 HF 模型。
     ref = hf(**inp).logits[:, -1, :].cpu()
     img_embeds = hf.model.visual(inp["pixel_values"], grid_thw=inp["image_grid_thw"]).cpu()
     pos = hf.model.get_rope_index(input_ids, inp["image_grid_thw"],
@@ -52,7 +52,7 @@ def main():
     gc.collect()
     torch.cuda.empty_cache()
 
-    # Our model
+    # 我们的模型
     mine = Qwen2LLM(Qwen2Config()).to(dev).half().eval()
     load_from_hf(mine, sd_cpu)
 

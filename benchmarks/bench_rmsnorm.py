@@ -1,9 +1,8 @@
-"""Micro-benchmark: fused Triton RMSNorm vs transformers' Qwen2RMSNorm.
+"""Micro-benchmark:融合 Triton RMSNorm vs transformers 的 Qwen2RMSNorm。
 
-Reports max numerical error and speedup across shapes that occur in the engine
-(decode batch, prefill sequence, large prefill). RMSNorm is memory-bound, so the
-fused single-pass kernel wins big in isolation — but see the README for the
-honest end-to-end number (it is a small slice of total time).
+报告引擎里会出现的几种 shape(decode batch、prefill 序列、大 prefill)下的最大数值
+误差和加速比。RMSNorm 访存受限,所以单趟融合 kernel 单独看赢很多——但端到端的诚实
+数字看 README(它只占总时间的一小块)。
 
     python bench_rmsnorm.py
 """

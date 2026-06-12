@@ -1,20 +1,20 @@
-"""Driver for a rigorous omniserve vs vLLM comparison.
+"""严谨的 omniserve vs vLLM 对比的驱动脚本。
 
-For each backend (separate process, since each needs most of the 8 GB GPU):
-  - production config (vLLM uses CUDA graphs, not enforce_eager)
-  - one warmup pass + N timed trials -> median throughput + spread
-  - true peak VRAM via nvidia-smi polling
-  - sample outputs captured so we can check the backends agree on content
+对每个后端(独立进程,因为各自都要占掉 8 GB GPU 的大部分):
+  - 生产配置(vLLM 用 CUDA graph,不是 enforce_eager)
+  - 一次预热 + N 次计时 trial -> 中位数吞吐 + 波动范围
+  - 用 nvidia-smi 轮询拿到真实显存峰值
+  - 抓取样本输出,这样能检查各后端在内容上是否一致
 
-Then prints a table and an output-agreement check.
+然后打印一张表和一个输出一致性检查。
 
     python compare.py --requests 24 --trials 3
 
-Caveats it is honest about:
-  * vLLM peak VRAM is a *reservation* (gpu_memory_utilization), not a measured
-    requirement, so the memory column is reported but not used to rank backends.
-  * omniserve has no paged attention / fused kernels / chunked prefill; the gap
-    to vLLM is the expected cost of those.
+它诚实标注的几个 caveat:
+  * vLLM 的显存峰值是**预留**(gpu_memory_utilization),不是实测需求,所以显存这列
+    只报告、不用来给后端排名。
+  * omniserve 没有 paged attention / 融合 kernel / chunked prefill;和 vLLM 的差距
+    就是这些东西该有的代价。
 """
 
 from __future__ import annotations
@@ -86,13 +86,12 @@ def norm(s: str) -> str:
 
 
 def output_agreement(a, b):
-    """Fraction of sampled prompts where both backends' outputs agree, plus a
-    char-level prefix-overlap as a softer signal."""
+    """两个后端输出完全一致的样本占比,外加一个字符级前缀重合率作为更软的信号。"""
     if not a or not b:
         return None
     n = min(len(a), len(b))
     exact = sum(norm(a[i]) == norm(b[i]) for i in range(n))
-    # average longest common prefix ratio
+    # 平均最长公共前缀比例
     def lcp(x, y):
         x, y = norm(x), norm(y)
         m = 0

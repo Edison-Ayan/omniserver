@@ -1,10 +1,9 @@
-"""Workload generator for multimodal inference benchmarking.
+"""多模态推理 benchmark 的 workload 生成器。
 
-Produces a request stream with a *controllable image reuse rate* — the axis we
-sweep to show the vision-embedding cache's effect. Higher reuse => more ViT
-forward passes the cache can skip. Images are synthesized locally so the
-benchmark needs no dataset download, and identical seeds produce byte-identical
-images (hence identical processor pixel_values => identical cache keys).
+产出一个请求流,带**可控的图片复用率**——这是我们用来展示 vision-embedding cache
+效果的扫描维度。复用越高 => cache 能跳过的 ViT 前向越多。图片在本地合成,所以
+benchmark 不用下数据集,而且相同 seed 产生逐字节相同的图(因此 processor 的
+pixel_values 相同 => cache key 相同)。
 """
 
 from __future__ import annotations
@@ -20,7 +19,7 @@ from PIL import Image, ImageDraw
 class Request:
     image: Image.Image
     prompt: str
-    image_id: int  # ground-truth id for verifying cache hit/miss accounting
+    image_id: int  # 真实 id,用于核对 cache 命中/未命中的统计
 
 
 QUESTIONS = [
@@ -49,8 +48,8 @@ def _make_image(seed: int, size: int = 448) -> Image.Image:
 
 
 def build_workload(n_requests: int, reuse_rate: float, seed: int = 0) -> List[Request]:
-    """reuse_rate in [0,1]: fraction of requests that reuse an already-seen image.
-    0 -> every request a unique image (no cache benefit); 1 -> all share one image.
+    """reuse_rate ∈ [0,1]:复用已出现过图片的请求占比。
+    0 -> 每个请求都是唯一图(cache 无收益);1 -> 全部共用一张图。
     """
     assert 0.0 <= reuse_rate <= 1.0
     rng = random.Random(seed)

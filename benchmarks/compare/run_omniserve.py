@@ -1,7 +1,7 @@
-"""Run the shared workload through omniserve and write metrics to JSON.
+"""把共享 workload 跑在 omniserve 上,把指标写成 JSON。
 
-Mirrors run_vllm.py: warmup pass + `--trials` timed passes (median reported by
-the driver), saves sample outputs. fp16 to match vLLM precision.
+和 run_vllm.py 对称:预热 + `--trials` 次计时(driver 取中位数),存样本输出。
+用 fp16 以匹配 vLLM 的精度。
 
     python run_omniserve.py --requests 24 --trials 3 --fp16 --out omniserve.json
 """
@@ -49,6 +49,7 @@ def main():
     ap.add_argument("--vision-cache", action="store_true")
     ap.add_argument("--prefix-cache", action="store_true")
     ap.add_argument("--max-running", type=int, default=32)
+    ap.add_argument("--native", action="store_true", help="use the zero-transformers native runner")
     ap.add_argument("--out", type=str, default="omniserve.json")
     args = ap.parse_args()
 
@@ -60,12 +61,16 @@ def main():
         from omniserve.cache import PrefixKVCache
         pc = PrefixKVCache(max_entries=args.requests)
 
-    runner = QwenVLRunner(load_in_4bit=not args.fp16, vision_cache=vc, prefix_cache=pc)
+    if args.native:
+        from omniserve.runners.qwen_vl_native import NativeQwenVLRunner
+        runner = NativeQwenVLRunner(max_running=args.max_running)
+    else:
+        runner = QwenVLRunner(load_in_4bit=not args.fp16, vision_cache=vc, prefix_cache=pc)
     reqs = build(args.requests, reuse_rate=args.reuse)
 
     def reset_caches():
-        # cold-start each timed run so the cache only exploits within-stream reuse
-        # (otherwise warmup primes it and the reuse rate becomes irrelevant).
+        # 每次计时都冷启动,这样 cache 只利用流内复用
+        # (否则预热会把它喂满,复用率就失去意义了)。
         if vc is not None:
             vc.clear()
         if pc is not None:

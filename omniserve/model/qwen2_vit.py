@@ -129,7 +129,7 @@ class Qwen2VIT(nn.Module):
 
 
 def load_vit_from_state_dict(vit: Qwen2VIT, sd: dict) -> None:
-    """Load weights from a HF checkpoint state_dict (keys prefixed 'visual.')."""
+    """从 HF checkpoint 的 state_dict 加载权重(key 前缀是 'visual.')。"""
     g = lambda k: sd["visual." + k]
     vit.patch_embed.weight.data.copy_(g("patch_embed.proj.weight"))
     for i, blk in enumerate(vit.blocks):

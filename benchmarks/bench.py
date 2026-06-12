@@ -1,13 +1,13 @@
-"""Benchmark: vision embedding cache vs. baseline on Qwen2-VL-2B (4-bit).
+"""Benchmark:vision embedding cache vs 基线,Qwen2-VL-2B(4-bit)。
 
-Sweeps the image reuse rate and reports, baseline vs cached:
-  TTFT (p50/p90, ms), decode tok/s, end-to-end req/s, peak VRAM, cache hit rate.
+扫图片复用率,报告 基线 vs 带 cache:
+  TTFT(p50/p90, ms)、decode tok/s、端到端 req/s、显存峰值、cache 命中率。
 
-Single point:   python bench.py --reuse 0.75 --requests 16
-Full sweep:     python bench.py --sweep --requests 24 --out results.csv
+单点:     python bench.py --reuse 0.75 --requests 16
+全扫:     python bench.py --sweep --requests 24 --out results.csv
 
-Tuned for an 8 GB GPU: 4-bit NF4, batch size 1 (serving-style sequential).
-Run with the weights already in the HF cache (set HF_HUB_OFFLINE=1 to be safe).
+为 8 GB GPU 调过:4-bit NF4,batch size 1(serving 风格的串行)。
+跑之前权重要已经在 HF cache 里(保险起见设 HF_HUB_OFFLINE=1)。
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root for `omniserve`
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根目录,为了 import `omniserve`
 from dataclasses import dataclass, field
 from threading import Thread
 from typing import List, Optional

@@ -1,7 +1,7 @@
-"""Verify the from-scratch LLM decode (with KV cache) matches HF greedy gen.
+"""验证从零写的 LLM decode(带 KV cache)和 HF greedy 生成一致。
 
-Same memory trick: capture HF's greedy continuation + reused bits on CPU, free
-HF, then prefill+decode through our model and compare the token sequences.
+同样的显存技巧:把 HF 的 greedy 续写 + 复用的东西抓到 CPU,释放 HF,再用我们的
+模型做 prefill+decode,对比 token 序列。
 """
 
 import gc
@@ -17,7 +17,7 @@ N = 20
 
 
 class SimpleCache:
-    """Minimal append-only multi-layer KV cache (cat-based) for checking."""
+    """最小的只追加多层 KV cache(cat-based),用于验证。"""
     def __init__(self, n_layers):
         self.k = [None] * n_layers
         self.v = [None] * n_layers
@@ -76,7 +76,7 @@ def main():
         tok = torch.tensor([[got[-1]]], device=dev)
         e = mine.embed_tokens(tok)
         p = torch.full((3, 1, 1), cur + rope_delta, device=dev, dtype=torch.long)
-        logits = mine(e, p, None, cache)[:, -1, :]  # full attention over cache
+        logits = mine(e, p, None, cache)[:, -1, :]  # 对整个 cache 做全注意力
         got.append(int(logits.argmax(-1).item()))
         cur += 1
 

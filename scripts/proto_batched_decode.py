@@ -1,8 +1,7 @@
-"""Prototype + correctness test for batched decode.
+"""批量 decode 的原型 + 正确性测试。
 
-Bar: batched decode must produce token-identical output to the (already
-verified) sequential decode path. We test equal-length first, then ragged
-lengths with left-padding.
+标准:批量 decode 必须和(已验证的)逐序列 decode 路径产生逐 token 一致的输出。
+先测等长,再测左 padding 的不等长。
 """
 
 import torch
@@ -36,7 +35,7 @@ def prefill(r, prompt, image):
 
 @torch.inference_mode()
 def seq_decode(r, cache, length, rope_delta, first_tok, n):
-    """Ground-truth: the existing single-sequence decode loop."""
+    """基准答案:已有的逐序列 decode 循环。"""
     toks = [first_tok]
     cur = length
     for _ in range(n):
@@ -51,8 +50,8 @@ def seq_decode(r, cache, length, rope_delta, first_tok, n):
 
 @torch.inference_mode()
 def batched_decode(r, states, n):
-    """states: list of dicts {cache, len, rope_delta, first_tok}.
-    Runs all sequences in ONE forward per step with left-padded KV."""
+    """states:list of dicts {cache, len, rope_delta, first_tok}。
+    每步用左 padding 的 KV 把所有序列放进一次前向。"""
     B = len(states)
     toks = [[s["first_tok"]] for s in states]
     lens = [s["len"] for s in states]
@@ -63,7 +62,7 @@ def batched_decode(r, states, n):
         legs = [s["cache"].to_legacy_cache() for s in states]
         n_layers = len(legs[0])
 
-        # build batched, left-padded legacy cache
+        # 拼出左 padding 的批量 legacy cache
         batched = []
         for li in range(n_layers):
             ks, vs = [], []
@@ -71,7 +70,7 @@ def batched_decode(r, states, n):
                 k, v = legs[b][li]            # [1, H, lens[b], D]
                 pad = max_len - k.shape[2]
                 if pad:
-                    k = torch.nn.functional.pad(k, (0, 0, pad, 0))  # left pad dim=2
+                    k = torch.nn.functional.pad(k, (0, 0, pad, 0))  # 在 dim=2 左侧 pad
                     v = torch.nn.functional.pad(v, (0, 0, pad, 0))
                 ks.append(k)
                 vs.append(v)
@@ -79,11 +78,11 @@ def batched_decode(r, states, n):
         bcache = DynamicCache.from_legacy_cache(batched)
 
         input_ids = torch.tensor([[t[-1]] for t in toks], device=device)  # [B,1]
-        # attention mask over [past max_len + 1 new]; left-padding => zeros on left
+        # 覆盖 [过去 max_len + 1 个新] 的注意力 mask;左 padding => 左边是 0
         attn = torch.zeros(B, max_len + 1, device=device, dtype=torch.long)
         for b in range(B):
             attn[b, max_len - lens[b]:] = 1
-        # explicit M-RoPE positions: new token position = current_len + rope_delta
+        # 显式 M-RoPE 位置:新 token 位置 = 当前长度 + rope_delta
         pos = torch.empty(3, B, 1, device=device, dtype=torch.long)
         for b in range(B):
             pos[:, b, 0] = lens[b] + states[b]["rope_delta"]
@@ -94,11 +93,11 @@ def batched_decode(r, states, n):
         logits = out.logits[:, -1, :]                 # [B, vocab]
         nxt = logits.argmax(-1).tolist()
 
-        # scatter updated KV back to each sequence's own cache
+        # 把更新后的 KV 散回每个序列自己的 cache
         new_legs = bcache.to_legacy_cache()
         for b in range(B):
             per = []
-            real = lens[b] + 1                        # this seq's true new length
+            real = lens[b] + 1                        # 这个序列真实的新长度
             for li in range(n_layers):
                 k, v = new_legs[li]                   # [B, H, max_len+1, D]
                 per.append((k[b:b+1, :, max_len + 1 - real:, :].contiguous(),

@@ -1,5 +1,5 @@
-"""Verify the from-scratch ViT matches HF's model.visual, loading weights via
-safetensors directly (no transformers from_pretrained for the weights)."""
+"""验证从零写的 ViT 和 HF 的 model.visual 一致,权重直接用 safetensors 加载
+(权重不走 transformers 的 from_pretrained)。"""
 
 import glob
 import os

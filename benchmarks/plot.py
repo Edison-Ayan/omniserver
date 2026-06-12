@@ -1,9 +1,9 @@
-"""Plot the vision-cache sweep results into the headline figure.
+"""把 vision-cache 扫描结果画成头条图。
 
     python plot.py results.csv      # -> results.png
 
-Produces a 1x3 panel: TTFT, throughput, and cache hit rate vs image reuse rate,
-baseline vs cached. This is the figure to put in the README / resume writeup.
+产出一个 1x3 面板:TTFT、吞吐、cache 命中率 对 图片复用率,基线 vs 带 cache。
+这就是放进 README / 简历的那张图。
 """
 
 import csv

@@ -1,7 +1,7 @@
-"""Correctness prototype for the preallocated KV cache.
+"""预分配 KV cache 的正确性原型。
 
-Bar: preallocated in-place decode must be token-identical to the (already
-verified) sequential decode. Tests ragged-length sequences in one batch.
+标准:预分配的原地 decode 必须和(已验证的)逐序列 decode 逐 token 一致。
+在一个 batch 里测不等长序列。
 """
 
 import torch
@@ -50,7 +50,7 @@ def seq_decode(r, cache, length, rope_delta, first_tok, n):
 
 @torch.inference_mode()
 def prealloc_decode(r, states, n):
-    """states: list of {cache(DynamicCache), len, rope_delta, first_tok}."""
+    """states:list of {cache(DynamicCache), len, rope_delta, first_tok}。"""
     B = len(states)
     device = r.device
     legs0 = states[0]["cache"].to_legacy_cache()
@@ -66,12 +66,12 @@ def prealloc_decode(r, states, n):
     toks = [[s["first_tok"]] for s in states]
     for _ in range(n):
         view = pool.view(B)
-        wpos = view.write_pos                       # [B] per-slot position of new token
+        wpos = view.write_pos                       # [B] 每个槽位新 token 的位置
         ret = view.ret_len
         input_ids = torch.tensor([[t[-1]] for t in toks], device=device)
         attn = torch.zeros(B, ret, device=device, dtype=torch.long)
         for b in range(B):
-            attn[b, : wpos[b] + 1] = 1              # new token sees [0, wpos]
+            attn[b, : wpos[b] + 1] = 1              # 新 token 能看到 [0, wpos]
         pos = torch.empty(3, B, 1, device=device, dtype=torch.long)
         pos[:, :, 0] = (wpos + rope).unsqueeze(0)
         out = r.model(input_ids=input_ids, past_key_values=view, use_cache=True,

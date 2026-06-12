@@ -1,8 +1,7 @@
-"""Shared workload + metrics for the omniserve vs vLLM comparison.
+"""omniserve vs vLLM 对比用的共享 workload + 指标。
 
-Every backend is fed the *identical* set of (image, prompt) requests and the
-same decoding settings, so differences in the reported numbers come from the
-serving engine, not the inputs. Images are synthesized locally (no dataset).
+每个后端都喂**完全相同**的 (图, prompt) 请求集和相同的解码设置,所以报告数字上的
+差异来自 serving 引擎本身,不是来自输入。图片在本地合成(不用数据集)。
 """
 
 from __future__ import annotations
@@ -14,7 +13,7 @@ from typing import List
 
 from PIL import Image, ImageDraw
 
-# Decoding settings shared by all backends (greedy, fixed budget).
+# 所有后端共用的解码设置(greedy,固定预算)。
 MAX_NEW_TOKENS = 64
 PROMPT = "Describe the shapes and their colors in this image."
 
@@ -39,8 +38,8 @@ def make_image(seed: int, size: int = 448) -> Image.Image:
 
 
 def build(n: int, reuse_rate: float = 0.0, seed: int = 0) -> List[Req]:
-    """n requests; reuse_rate controls how many share an image (for the
-    vision-cache story). reuse_rate=0 -> all distinct images."""
+    """n 个请求;reuse_rate 控制多少个共用一张图(给 vision-cache 的故事用)。
+    reuse_rate=0 -> 全部是不同的图。"""
     rng = random.Random(seed)
     n_unique = max(1, round(n * (1.0 - reuse_rate)))
     reqs = []

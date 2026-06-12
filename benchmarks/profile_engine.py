@@ -1,8 +1,7 @@
-"""Profile where omniserve spends time on a concurrent multimodal workload.
+"""剖析 omniserve 在并发多模态 workload 上把时间花在哪。
 
-Breaks wall time into prefill vs decode (the two model phases) vs scheduler/
-overhead, with CUDA syncs for accurate GPU timing. This tells us which phase to
-optimize first instead of guessing.
+把墙钟时间拆成 prefill vs decode(两个模型阶段)vs 调度/开销,用 CUDA 同步保证 GPU
+计时准确。这样能知道该先优化哪个阶段,而不是靠猜。
 
     python profile_engine.py --requests 24
 """
@@ -25,7 +24,7 @@ from omniserve.runners.qwen_vl import QwenVLRunner  # noqa: E402
 
 
 class Timed:
-    """Wrap runner.prefill/decode to accumulate CUDA-accurate timings."""
+    """包住 runner.prefill/decode,累计 CUDA 级精确的耗时。"""
     def __init__(self, runner):
         self.runner = runner
         self.prefill_s = 0.0
@@ -61,7 +60,7 @@ def main():
     ap.add_argument("--max-running", type=int, default=32)
     args = ap.parse_args()
 
-    runner = QwenVLRunner(load_in_4bit=False)  # fp16, matches the comparison
+    runner = QwenVLRunner(load_in_4bit=False)  # fp16,和对比保持一致
     prof = Timed(runner).install()
     engine = LLMEngine(runner, SchedulerConfig(max_running=args.max_running,
                                                max_prefill_per_step=1))
@@ -71,7 +70,7 @@ def main():
         engine.add_request(Request(prompt=PROMPT, images=[make_image(r.image_seed)],
                                    sampling=SamplingParams(max_new_tokens=MAX_NEW_TOKENS, temperature=0.0)))
 
-    # warmup not needed for a breakdown; time the whole run
+    # 做拆解不需要预热;直接给整次运行计时
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     steps = 0

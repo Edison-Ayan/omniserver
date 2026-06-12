@@ -1,9 +1,8 @@
-"""Run the shared workload through vLLM and write metrics to JSON.
+"""把共享 workload 跑在 vLLM 上,把指标写成 JSON。
 
-Production-ish config: CUDA graphs enabled (NOT enforce_eager), fp16. Does a
-warmup pass, then `--trials` timed passes, reporting per-trial throughput so the
-driver can take a median. Saves a few sample outputs so we can verify the
-backends actually produce comparable text (not just comparable token counts).
+接近生产的配置:开 CUDA graph(不是 enforce_eager),fp16。先跑一次预热,再跑
+`--trials` 次计时,报告每个 trial 的吞吐,好让 driver 取中位数。存几个样本输出,
+这样能验证各后端确实产生可比的文本(不只是可比的 token 数量)。
 
     python run_vllm.py --requests 24 --trials 3 --out vllm.json
 """
@@ -26,7 +25,7 @@ def main():
     ap.add_argument("--requests", type=int, default=24)
     ap.add_argument("--reuse", type=float, default=0.0)
     ap.add_argument("--trials", type=int, default=3)
-    ap.add_argument("--mem-util", type=float, default=0.9)  # fp16 weights ~4.4GB; needs headroom for KV
+    ap.add_argument("--mem-util", type=float, default=0.9)  # fp16 权重 ~4.4GB;要给 KV 留余量
     ap.add_argument("--out", type=str, default="vllm.json")
     args = ap.parse_args()
 
@@ -43,14 +42,13 @@ def main():
     inputs = [{"prompt": prompt_text,
                "multi_modal_data": {"image": make_image(r.image_seed)}} for r in reqs]
 
-    # Production config: CUDA graphs ON (no enforce_eager). mem-util governs the
-    # KV reservation; we keep it modest and report it as a *reservation*, not a
-    # measured working set (see README note).
+    # 生产配置:CUDA graph 开(不用 enforce_eager)。mem-util 决定 KV 预留;
+    # 我们设得适中,并把它当作**预留**报告,而不是实测工作集(见 README 说明)。
     llm = LLM(model=MODEL_ID, max_model_len=2048, gpu_memory_utilization=args.mem_util,
               limit_mm_per_prompt={"image": 1}, dtype="float16")
     sp = SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=0.0)
 
-    # warmup (compile CUDA graphs, fill caches) — not timed
+    # 预热(编译 CUDA graph、填好 cache)—— 不计时
     llm.generate(inputs, sp)
 
     torch.cuda.reset_peak_memory_stats()

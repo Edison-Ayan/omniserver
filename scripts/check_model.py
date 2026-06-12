@@ -1,9 +1,9 @@
-"""Minimal sanity check: can this machine load Qwen2-VL-2B in 4-bit and
-generate from a real image? Reports actual peak VRAM so we stop guessing.
+"""最小可行性检查:这台机器能不能用 4-bit 加载 Qwen2-VL-2B 并对真实图片做生成?
+报告实际的显存峰值,这样就不用瞎猜了。
 
-Run:
+运行:
     python scripts/check_model.py
-First run downloads ~weights to the HF cache.
+首次运行会把权重下到 HF cache。
 """
 
 import time

@@ -86,12 +86,15 @@ class Attention(nn.Module):
         k = k.view(B, L, self.nkv, self.hd).transpose(1, 2)
         v = v.view(B, L, self.nkv, self.hd).transpose(1, 2)
         q, k = apply_mrope(q, k, cos, sin, self.mrope_section)
+        # decode 走 FlashAttention(GQA-native,不物化 KV,比 SDPA+repeat_interleave
+        # 快 ~11x);prefill 没有 flash_decode 的 cache,走下面的 SDPA。
+        if cache is not None and hasattr(cache, "flash_decode"):
+            out = cache.flash_decode(q[:, :, 0, :].contiguous(), k[:, :, 0, :], v[:, :, 0, :],
+                                     layer_idx, self.hd ** -0.5)     # [B, nh, hd]
+            return self.o_proj(out.reshape(B, L, self.nh * self.hd))
         if cache is not None:
             k, v = cache.update(k, v, layer_idx)   # 返回完整的 K/V 窗口
-        # GQA:把 KV 头物化扩到 query 头数。nsys 显示这个 repeat_interleave 占 decode
-        # ~19%,但实测换成 SDPA enable_gqa(不物化、kernel 内广播)反而更慢——因为那会
-        # 让 SDPA 放弃快的 fmha kernel、回退到慢的 math 后端。物化+快kernel > 广播+慢kernel。
-        # 想两全(GQA-aware 且快)需要 FlashAttention,SDPA 给不了——这正是 vLLM 的护城河。
+        # GQA:把 KV 头物化扩到 query 头数(prefill 路径用 SDPA)
         rep = self.nh // self.nkv
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)

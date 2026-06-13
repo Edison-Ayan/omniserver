@@ -70,6 +70,30 @@ class _PackedPrefillWriter:
     def __init__(self, pool: PreallocatedKVCache, slots, seg_lengths):
         self.pool, self.slots, self.seg = pool, slots, seg_lengths
 
+    def flash_prefill(self, q, k, v, layer_idx, scale):
+        """用 FlashAttention varlen 做 prefill 注意力:把打包的各段 prompt 用 cu_seqlens
+        分隔,只算段内因果注意力(O(sum L²),不像块对角 SDPA 那样 O(total²) 浪费)。
+        q/k/v: [total, nh/nkv, hd]。各段 KV 写进各自池槽位。"""
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+        pool = self.pool
+        # 各段 KV 写进槽位(池布局 [slot, nkv, max_len, hd])
+        off = 0
+        for slot, L in zip(self.slots, self.seg):
+            pool.k[layer_idx][slot, :, :L, :] = k[off:off + L].transpose(0, 1)
+            pool.v[layer_idx][slot, :, :L, :] = v[off:off + L].transpose(0, 1)
+            off += L
+        cu = torch.zeros(len(self.seg) + 1, device=q.device, dtype=torch.int32)
+        cu[1:] = torch.tensor(self.seg, device=q.device, dtype=torch.int32).cumsum(0)
+        max_seg = max(self.seg)
+        out = flash_attn_varlen_func(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            max_seqlen_q=max_seg, cu_seqlens_q=cu, max_seqlen_k=max_seg, cu_seqlens_k=cu,
+            softmax_scale=scale, causal=True)              # [total, nh, hd]
+        if layer_idx == pool.n_layers - 1:
+            for slot, L in zip(self.slots, self.seg):
+                pool.lengths[slot] = L
+        return out
+
     def update(self, k, v, layer_idx):
         # k, v: [1, n_kv_heads, total, head_dim](所有段打包在一起,rope 已应用)
         off = 0

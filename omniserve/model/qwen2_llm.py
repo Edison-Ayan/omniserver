@@ -92,6 +92,11 @@ class Attention(nn.Module):
             out = cache.flash_decode(q[:, :, 0, :].contiguous(), k[:, :, 0, :], v[:, :, 0, :],
                                      layer_idx, self.hd ** -0.5)     # [B, nh, hd]
             return self.o_proj(out.reshape(B, L, self.nh * self.hd))
+        if cache is not None and hasattr(cache, "flash_prefill"):
+            # 打包 prefill 走 flash varlen(段内因果,O(sum L²),不再 O(total²) SDPA)
+            out = cache.flash_prefill(q[0].transpose(0, 1), k[0].transpose(0, 1),
+                                      v[0].transpose(0, 1), layer_idx, self.hd ** -0.5)
+            return self.o_proj(out.reshape(B, L, self.nh * self.hd))
         if cache is not None:
             k, v = cache.update(k, v, layer_idx)   # 返回完整的 K/V 窗口
         # GQA:把 KV 头物化扩到 query 头数(prefill 路径用 SDPA)

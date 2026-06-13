@@ -102,18 +102,10 @@ class NativeQwenVLRunner(ModelRunner):
 
         packed_emb = torch.cat(embeds, dim=1)          # [1, total, hidden]
         packed_pos = torch.cat(positions, dim=2)       # [3, 1, total]
-        total = sum(seg_lens)
-        # 块对角因果 mask:每段内部是因果,段之间互不可见(保持各 prompt 独立)
-        mask = torch.full((total, total), float("-inf"), device=dev, dtype=torch.float16)
-        off = 0
-        for L in seg_lens:
-            mask[off:off + L, off:off + L] = torch.triu(
-                torch.full((L, L), float("-inf"), device=dev, dtype=torch.float16), 1)
-            off += L
-        mask = mask[None, None]                        # [1, 1, total, total]
-
+        # 注意力走 FlashAttention varlen(段内因果),由 cache.flash_prefill 用 cu_seqlens
+        # 处理段边界,不再需要 O(total²) 的块对角 mask。
         cache = self._pool.packed_prefill_cache(slots, seg_lens)
-        logits = self.llm(packed_emb, packed_pos, mask, cache)[0]   # [total, vocab]
+        logits = self.llm(packed_emb, packed_pos, None, cache)[0]   # [total, vocab]
 
         # 每段最后一个 token 的 logits -> 该序列的第一个生成 token
         off = 0

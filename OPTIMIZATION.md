@@ -12,10 +12,15 @@ bottleneck → fix it → re-measure → know when to stop.
 |---|---|---|---|
 | sequential decode (naive) | 53 | 0.18x | 5.4x |
 | + batched decode | 172 | 0.34x | 2.9x |
-| + preallocated KV pool | **220** | **0.44x** | **2.3x** |
+| + preallocated KV pool | 220 | 0.44x | 2.3x |
+| + layer kernel fusion | 221 | 0.44x | 2.3x |
+| + FlashAttention (decode) | **236** | **0.47x** | **2.1x** |
 
-Two self-implemented, profile-driven structural changes took the gap from
-**5.4x to 2.3x**. The rest is analyzed below.
+Structural + kernel changes took the gap from **5.4x to 2.1x** on this
+(prefill-heavy) benchmark. **On a decode-heavy workload (gen=200) the same engine
+is 0.68x of vLLM** — FlashAttention lifted decode from 0.51x → 0.68x, because the
+short-generation benchmark above dilutes decode gains with sequential prefill.
+The rest is analyzed below.
 
 ---
 
@@ -85,6 +90,29 @@ gate_up** (one GEMM), **fused SiLU×Mul** (Triton), and **residual-carried
 fused add+RMSNorm** (Triton, the add folded into the norm — vLLM never writes an
 explicit `x = x + ...`). All token-identical. End-to-end: **+2%** (216 → 221 tok/s).
 Amdahl again — see the nsys breakdown below for why.
+
+## 6. FlashAttention for decode — reuse vLLM's binary, decode 1.5x
+
+The nsys analysis (below) said decode's attention (SDPA `fmha`) + the GQA KV
+materialization were ~39% of decode, and that the fix was FlashAttention — but
+building flash-attn here kept hitting the nvcc / cu130 wall. **The unlock: vLLM
+already ships a flash binary** (`vllm.vllm_flash_attn`) that is ABI-matched to
+this torch/CUDA — import it, zero compilation.
+
+Integration (`omniserve/cache/kv_prealloc.py::flash_decode`): treat each KV-pool
+slot as one paged block (`block_size = max_len`), pass `block_table` + `seqused_k`
+so `flash_attn_varlen_func` reads the pool directly (no gather), GQA-native (no KV
+materialization). Micro-bench flash vs SDPA+materialize: **11.56x**. In the engine:
+decode **29.6 → 19.65 ms (1.5x, 541 → 814 tok/s)**; output 3/4 token-identical to
+HF, 1/4 semantically equal (flash's own fp16 numerics, same as vLLM-vs-HF).
+**Decode-heavy end-to-end (gen=200): 0.51x → 0.68x of vLLM.**
+
+The honest twist: this did **not** make decode launch-bound (back-to-back ≈ synced,
+still **1.0**). FlashAttention removed the attention cost, so now the **GEMMs are
+~82% of decode** — bandwidth-bound on weight reads. So CUDA graphs still wouldn't
+help (§ below holds); the next lever is a **quantized GEMM** (Marlin/FP8), not graphs.
+Reusing a production binary instead of fighting a compiler was the highest-leverage
+move of the whole project.
 
 ## Why vLLM is fast — the compounding chain (nsys evidence)
 

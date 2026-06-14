@@ -17,10 +17,20 @@ bottleneck → fix it → re-measure → know when to stop.
 | + FlashAttention (decode) | 236 | 0.47x | 2.1x |
 | + FlashAttention (prefill) + ViT patch_embed matmul | **280** | **0.56x** | **1.8x** |
 
-Structural + kernel changes took the gap from **5.4x to 2.1x** on this
-(prefill-heavy) benchmark. **On a decode-heavy workload (gen=200) the same engine
-is 0.68x of vLLM** — FlashAttention lifted decode from 0.51x → 0.68x, because the
-short-generation benchmark above dilutes decode gains with sequential prefill.
+Structural + kernel changes took the gap from **5.4x to 1.8x** on this
+(prefill-heavy) benchmark. But the per-phase picture is the real story:
+
+> **Decode (batch 16, fp16): omniserve is 1.32x *faster* than vLLM.** Measured by
+> the decode slope (gen 64→320, which cancels prefill): omniserve 709 tok/s vs
+> vLLM 535 tok/s. At small batch, decode is memory-bandwidth-bound (both at the
+> weight-read floor), and omniserve's lean flash+preallocated-pool path has less
+> overhead than vLLM's general engine (vLLM is tuned for large batches).
+>
+> **The entire same-precision gap is prefill** — vLLM batches the ViT and overlaps
+> prefill with decode (chunked prefill); omniserve runs the ViT per image and
+> prefills as a separate phase. The benchmark numbers above are prefill-dominated
+> and hide the decode win.
+
 The rest is analyzed below.
 
 ---

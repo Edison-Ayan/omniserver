@@ -14,7 +14,8 @@ bottleneck → fix it → re-measure → know when to stop.
 | + batched decode | 172 | 0.34x | 2.9x |
 | + preallocated KV pool | 220 | 0.44x | 2.3x |
 | + layer kernel fusion | 221 | 0.44x | 2.3x |
-| + FlashAttention (decode) | **236** | **0.47x** | **2.1x** |
+| + FlashAttention (decode) | 236 | 0.47x | 2.1x |
+| + FlashAttention (prefill) + ViT patch_embed matmul | **280** | **0.56x** | **1.8x** |
 
 Structural + kernel changes took the gap from **5.4x to 2.1x** on this
 (prefill-heavy) benchmark. **On a decode-heavy workload (gen=200) the same engine

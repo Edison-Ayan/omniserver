@@ -46,21 +46,21 @@ class VisionBlock(nn.Module):
         self.hd = dim // n_heads
 
     def attn(self, x, cos, sin, cu_seqlens):
+        # ViT 注意力用 FlashAttention varlen(cu_seqlens 分隔各图,一次调用、无 Python
+        # 段循环)——和 vLLM 的 ViT 一样。hd=80 flash 是支持的(误差 1e-4);批量多图时
+        # 这避免了逐段循环的开销,是 ViT 能批量加速的关键。
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
         S = x.shape[0]
         qkv = self.attn_qkv(x).reshape(S, 3, self.n_heads, self.hd).permute(1, 0, 2, 3)
         q, k, v = qkv[0], qkv[1], qkv[2]            # [S, nh, hd]
         q, k = apply_rotary_vision(q, k, cos, sin)
-        # 每张图段内部做全注意力(cu_seqlens 划分各张图)
-        outs = []
-        for i in range(len(cu_seqlens) - 1):
-            a, b = cu_seqlens[i], cu_seqlens[i + 1]
-            qs = q[a:b].transpose(0, 1).unsqueeze(0)   # [1, nh, L, hd]
-            ks = k[a:b].transpose(0, 1).unsqueeze(0)
-            vs = v[a:b].transpose(0, 1).unsqueeze(0)
-            o = F.scaled_dot_product_attention(qs, ks, vs)
-            outs.append(o.squeeze(0).transpose(0, 1))  # [L, nh, hd]
-        out = torch.cat(outs, dim=0).reshape(S, -1)
-        return self.attn_proj(out)
+        cu = cu_seqlens.to(torch.int32)
+        max_seg = int((cu[1:] - cu[:-1]).max())
+        out = flash_attn_varlen_func(
+            q.contiguous(), k.contiguous(), v.contiguous(),
+            cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=max_seg, max_seqlen_k=max_seg,
+            softmax_scale=self.hd ** -0.5, causal=False)   # [S, nh, hd]
+        return self.attn_proj(out.reshape(S, -1))
 
     def forward(self, x, cos, sin, cu_seqlens):
         x = x + self.attn(self.norm1(x), cos, sin, cu_seqlens)

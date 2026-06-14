@@ -50,10 +50,11 @@ class VisionBlock(nn.Module):
         # 段循环)——和 vLLM 的 ViT 一样。hd=80 flash 是支持的(误差 1e-4);批量多图时
         # 这避免了逐段循环的开销,是 ViT 能批量加速的关键。
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+        from ..kernels.vision_rope import vision_rope
         S = x.shape[0]
         qkv = self.attn_qkv(x).reshape(S, 3, self.n_heads, self.hd).permute(1, 0, 2, 3)
         q, k, v = qkv[0], qkv[1], qkv[2]            # [S, nh, hd]
-        q, k = apply_rotary_vision(q, k, cos, sin)
+        q, k = vision_rope(q.contiguous(), k.contiguous(), cos, sin)  # 融合 rotary kernel
         cu = cu_seqlens.to(torch.int32)
         max_seg = int((cu[1:] - cu[:-1]).max())
         out = flash_attn_varlen_func(

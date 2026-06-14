@@ -15,7 +15,8 @@ bottleneck → fix it → re-measure → know when to stop.
 | + preallocated KV pool | 220 | 0.44x | 2.3x |
 | + layer kernel fusion | 221 | 0.44x | 2.3x |
 | + FlashAttention (decode) | 236 | 0.47x | 2.1x |
-| + FlashAttention (prefill) + ViT patch_embed matmul | **280** | **0.56x** | **1.8x** |
+| + FlashAttention (prefill) + ViT patch_embed matmul | 280 | 0.56x | 1.8x |
+| + batched prefill (last-token logits only) | **329** | **0.65x** | **1.5x** |
 
 Structural + kernel changes took the gap from **5.4x to 1.8x** on this
 (prefill-heavy) benchmark. But the per-phase picture is the real story:

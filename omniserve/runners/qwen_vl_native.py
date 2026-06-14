@@ -83,16 +83,18 @@ class NativeQwenVLRunner(ModelRunner):
         mask 让每个 prompt 只注意自己内部。这样权重只读一次、GPU 喂满,替代原来
         一个一个 prefill。每段的 KV 写进各自的池槽位。"""
         dev = self.device
+        # ViT 逐图跑(实测批量 ViT 不快:ViT 处理 1024 patch/图,M=1024 的 GEMM 已喂满
+        # GPU,批量不增效)。LLM prefill 仍打包成一次前向(下面)。
         embeds, positions, seg_lens, slots, deltas = [], [], [], [], []
         for seq in seqs:
-            p = self._pending.pop(seq.request_id)
-            ids = p["ids"]
+            m = self._pending.pop(seq.request_id)
+            ids = m["ids"]
             L = ids.shape[1]
             emb = self.llm.embed_tokens(ids).clone()
-            if p["pixel_values"] is not None:
-                vis = self.vit(p["pixel_values"], p["grid_thw"])
-                emb[ids == self.image_token_id] = vis.to(emb.dtype)
-            pos, delta = mrope_position_ids(ids, p["grid_thw"]) if p["grid_thw"] is not None \
+            if m["pixel_values"] is not None:
+                emb[ids == self.image_token_id] = self.vit(
+                    m["pixel_values"], m["grid_thw"]).to(emb.dtype)
+            pos, delta = mrope_position_ids(ids, m["grid_thw"]) if m["grid_thw"] is not None \
                 else self._text_positions(ids)
             embeds.append(emb)                 # [1, L, hidden]
             positions.append(pos)              # [3, 1, L]

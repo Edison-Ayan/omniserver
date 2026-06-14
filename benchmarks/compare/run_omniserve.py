@@ -25,7 +25,8 @@ from omniserve.runners.qwen_vl import QwenVLRunner  # noqa: E402
 
 
 def run_once(runner, reqs, max_running):
-    engine = LLMEngine(runner, SchedulerConfig(max_running=max_running, max_prefill_per_step=1))
+    engine = LLMEngine(runner, SchedulerConfig(
+        max_running=max_running, max_prefill_per_step=max_running, max_prefill_tokens=16384))
     for r in reqs:
         engine.add_request(Request(
             prompt=PROMPT, images=[make_image(r.image_seed)],

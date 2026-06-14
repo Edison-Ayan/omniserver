@@ -104,18 +104,17 @@ class NativeQwenVLRunner(ModelRunner):
         packed_pos = torch.cat(positions, dim=2)       # [3, 1, total]
         # 注意力走 FlashAttention varlen(段内因果),由 cache.flash_prefill 用 cu_seqlens
         # 处理段边界,不再需要 O(total²) 的块对角 mask。
+        # 只取每段最后一个 token 的位置算 logits(避免 [total, vocab] 的巨大 OOM)。
+        last_idx = torch.tensor(
+            [sum(seg_lens[:i + 1]) - 1 for i in range(len(seg_lens))], device=dev)
         cache = self._pool.packed_prefill_cache(slots, seg_lens)
-        logits = self.llm(packed_emb, packed_pos, None, cache)[0]   # [total, vocab]
+        logits = self.llm(packed_emb, packed_pos, None, cache, logits_indices=last_idx)[0]  # [num_seg, vocab]
 
-        # 每段最后一个 token 的 logits -> 该序列的第一个生成 token
-        off = 0
         for i, seq in enumerate(seqs):
-            L = seg_lens[i]
             self._slot_seq.append(seq)
             seq.kv_handle = {"slot": slots[i], "rope_delta": deltas[i]}
-            seq.append_token(self._sample(logits[off + L - 1: off + L], seq))
+            seq.append_token(self._sample(logits[i:i + 1], seq))
             seq.maybe_finish()
-            off += L
 
     @staticmethod
     def _text_positions(ids):

@@ -160,7 +160,7 @@ class Qwen2LLM(nn.Module):
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos(), emb.sin()
 
-    def forward(self, inputs_embeds, position_ids, attn_mask, cache=None):
+    def forward(self, inputs_embeds, position_ids, attn_mask, cache=None, logits_indices=None):
         cos, sin = self.rope(position_ids)
         cos, sin = cos.to(inputs_embeds.dtype), sin.to(inputs_embeds.dtype)
         h = inputs_embeds
@@ -168,6 +168,9 @@ class Qwen2LLM(nn.Module):
         for i, layer in enumerate(self.layers):
             h, residual = layer(h, residual, cos, sin, attn_mask, cache, i)
         h, _ = self.norm(h, residual)   # 最终 norm 折进最后一次残差 add
+        # 打包 prefill 只需每段最后一个 token 的 logits(其余白算,且 [total, vocab] 会 OOM)
+        if logits_indices is not None:
+            h = h[:, logits_indices, :]
         return self.lm_head(h)
 
 

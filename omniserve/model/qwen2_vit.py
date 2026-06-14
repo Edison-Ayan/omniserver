@@ -75,10 +75,11 @@ class Qwen2VIT(nn.Module):
         super().__init__()
         self.embed_dim = embed_dim
         self.spatial_merge_size = spatial_merge_size
-        self.patch_embed = nn.Conv3d(
-            in_chans, embed_dim,
-            kernel_size=(temporal_patch_size, patch_size, patch_size),
-            stride=(temporal_patch_size, patch_size, patch_size), bias=False)
+        # patch_embed:Conv3d(kernel=stride) 等价于对展平 patch 的一个矩阵乘。HF/PyTorch
+        # 把 Conv3d 实现成 vol2col+GEMV(nsys 显示占 ViT ~38%、3 万个小 kernel,极低效),
+        # 这里直接用一个 Linear 权重做 matmul,无损且快得多。
+        patch_dim = in_chans * temporal_patch_size * patch_size * patch_size
+        self.patch_embed_w = nn.Parameter(torch.zeros(embed_dim, patch_dim))
         self.blocks = nn.ModuleList([
             VisionBlock(embed_dim, n_heads, embed_dim * mlp_ratio) for _ in range(depth)])
         merged = embed_dim * spatial_merge_size ** 2
@@ -115,9 +116,8 @@ class Qwen2VIT(nn.Module):
 
     @torch.inference_mode()
     def forward(self, pixel_values, grid_thw):
-        c, tp, ps = self._in
-        x = pixel_values.view(-1, c, tp, ps, ps).to(self.patch_embed.weight.dtype)
-        x = self.patch_embed(x).view(-1, self.embed_dim)
+        # patch_embed 用矩阵乘:pixel_values 已是展平的 patch [N, patch_dim]
+        x = pixel_values.to(self.patch_embed_w.dtype) @ self.patch_embed_w.t()  # [N, embed_dim]
         # 踩坑:cos/sin 全程保持 fp32(不要 .to(fp16)),否则同样会在深层链放大
         cos, sin = self._rot_pos_emb(grid_thw, x.device)
         cu = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).cumsum(0)
@@ -131,7 +131,8 @@ class Qwen2VIT(nn.Module):
 def load_vit_from_state_dict(vit: Qwen2VIT, sd: dict) -> None:
     """从 HF checkpoint 的 state_dict 加载权重(key 前缀是 'visual.')。"""
     g = lambda k: sd["visual." + k]
-    vit.patch_embed.weight.data.copy_(g("patch_embed.proj.weight"))
+    # Conv3d 权重 [embed_dim, c, t, ps, ps] 展平成 [embed_dim, patch_dim] 给 matmul 用
+    vit.patch_embed_w.data.copy_(g("patch_embed.proj.weight").reshape(vit.embed_dim, -1))
     for i, blk in enumerate(vit.blocks):
         p = f"blocks.{i}."
         blk.norm1.weight.data.copy_(g(p + "norm1.weight")); blk.norm1.bias.data.copy_(g(p + "norm1.bias"))

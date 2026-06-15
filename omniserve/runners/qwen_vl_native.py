@@ -30,7 +30,8 @@ DEFAULT_SNAPSHOT = os.path.expanduser(
 
 class NativeQwenVLRunner(ModelRunner):
     def __init__(self, model_dir: str = None, max_running: int = 32, max_len: int = 1024,
-                 prefix_cache=None, quant: str = None, gptq_dir: str = None):
+                 prefix_cache=None, quant: str = None, gptq_dir: str = None,
+                 use_graph: bool = False):
         model_dir = model_dir or glob.glob(DEFAULT_SNAPSHOT)[0]
         self.device = "cuda"
         self.tokenizer = Qwen2VLTokenizer(os.path.join(model_dir, "tokenizer.json"))
@@ -71,6 +72,12 @@ class NativeQwenVLRunner(ModelRunner):
         gc.collect()
         torch.cuda.empty_cache()
 
+        # ⚠️ WIP:decode CUDA graph(消除 28 层 kernel 间 GPU 间隙,验证过 replay 快 1.16x)。
+        # KV 布局已改成 graph-friendly([B,max_len,nkv,hd] + 单维 index_copy_,索引/seqused 都图外
+        # 预算成 static buffer)。但 flash 的 paged read 在 graph replay 下仍有 illegal access 未解,
+        # 故默认 use_graph=False 走 eager。layout 重构本身已让 eager decode 12.6→11.8ms(免 transpose)。
+        self._use_graph = use_graph
+        self._graphs: Dict[int, tuple] = {}  # n -> (graph, static_buffers)
         self._pending: Dict[str, dict] = {}
         cfg = self.llm.cfg
         self._pool = PreallocatedKVCache(
@@ -201,21 +208,27 @@ class NativeQwenVLRunner(ModelRunner):
         seqs = sorted(seqs, key=lambda s: s.kv_handle["slot"])
         n = len(seqs)
         assert all(seqs[b].kv_handle["slot"] == b for b in range(n))
+        if self._use_graph:
+            self._decode_graph(seqs, n)
+        else:
+            self._decode_eager(seqs, n)
+
+    def _decode_eager(self, seqs, n):
         dev = self.device
         view = self._pool.view(n)
-        wpos = view.write_pos
         ids = torch.tensor([[s.last_token_id()] for s in seqs], device=dev)
         rope = torch.tensor([s.kv_handle["rope_delta"] for s in seqs], device=dev)
         pos = torch.empty(3, n, 1, device=dev, dtype=torch.long)
-        pos[:, :, 0] = (wpos + rope).unsqueeze(0)
-        # decode 注意力走 view.flash_decode(用 seqused_k 表达各序列有效长度),不需要
-        # additive mask——以前逐序列 Python 循环构造的 mask 是死代码(qwen2_llm 的 flash
-        # 路径直接忽略 attn_mask),却每次 wpos[b] 切片触发 .item() 同步,纯 CPU launch 开销。
+        pos[:, :, 0] = (view.write_pos + rope).unsqueeze(0)
+        # decode 注意力走 flash_decode(seqused_k 表达有效长度),不需要 additive mask。
         emb = self.llm.embed_tokens(ids)
         logits = self.llm(emb, pos, None, view)[:, -1, :]
+        self._emit(seqs, logits)
+
+    def _emit(self, seqs, logits):
         # 批量采样:全 greedy 时一次 argmax + 一次 tolist(1 次同步),替代逐序列 .item()(n 次)。
         if all(s.request.sampling.greedy for s in seqs):
-            toks = logits.argmax(dim=-1).tolist()
+            toks = logits[:len(seqs)].argmax(dim=-1).tolist()
             for b, seq in enumerate(seqs):
                 seq.append_token(toks[b])
                 seq.maybe_finish()
@@ -223,6 +236,52 @@ class NativeQwenVLRunner(ModelRunner):
             for b, seq in enumerate(seqs):
                 seq.append_token(self._sample(logits[b:b + 1], seq))
                 seq.maybe_finish()
+
+    def _capture_graph(self, n):
+        """capture 固定 batch=n 的 decode 前向。KV 布局 [B,max_len,nkv,hd] + 单维 index_copy_
+        写入是 graph 友好的;static buffer 每步更新值后 replay,消除 28 层 kernel 间 GPU 调度间隙。"""
+        dev = self.device
+        ml = self._pool.max_len
+        rows = torch.arange(n, device=dev)
+        buf = {"ids": torch.zeros(n, 1, dtype=torch.long, device=dev),
+               "pos": torch.zeros(3, n, 1, dtype=torch.long, device=dev),
+               "wpos": self._pool.lengths[:n].clone(),
+               "flat": (rows * ml + self._pool.lengths[:n]).clone(),
+               "seqused": (self._pool.lengths[:n] + 1).to(torch.int32),
+               "rows": rows}
+        view = self._pool.view_graph(n, buf["wpos"], buf["flat"], buf["seqused"])
+
+        def fwd():
+            emb = self.llm.embed_tokens(buf["ids"])
+            return self.llm(emb, buf["pos"], None, view)[:, -1, :]
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                fwd()
+        torch.cuda.current_stream().wait_stream(s)
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            buf["logits"] = fwd()
+        self._graphs[n] = (g, buf)
+
+    def _decode_graph(self, seqs, n):
+        dev = self.device
+        if n not in self._graphs:
+            self._capture_graph(n)
+        g, buf = self._graphs[n]
+        ids = torch.tensor([[s.last_token_id()] for s in seqs], device=dev)
+        rope = torch.tensor([s.kv_handle["rope_delta"] for s in seqs], device=dev)
+        lengths = self._pool.lengths[:n]
+        buf["ids"].copy_(ids)
+        buf["wpos"].copy_(lengths)
+        buf["flat"].copy_(buf["rows"] * self._pool.max_len + lengths)   # 图外预算 flat 索引
+        buf["seqused"].copy_((lengths + 1).to(torch.int32))            # 图外预算 flash seqused_k
+        buf["pos"][:, :, 0].copy_((lengths + rope).unsqueeze(0))
+        g.replay()
+        self._pool.lengths[:n] += 1                # graph 不在图内改 lengths,这里更新
+        self._emit(seqs, buf["logits"])
 
     def free(self, seq: Sequence) -> None:
         slot = seq.kv_handle.get("slot")

@@ -18,9 +18,10 @@ results/
 benchmarks/compare/*.json
 
 # model weights / caches (never commit — pulled from HF hub)
+# 注意:不要用 `models/` 这种目录规则,会误伤 omniserve/models/ 代码目录;
+# 权重是 *.safetensors / *.bin,按扩展名排除即可。
 *.safetensors
 *.bin
-models/
 .cache/
 
 # editor / OS

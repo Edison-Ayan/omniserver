@@ -51,6 +51,9 @@ def main():
     ap.add_argument("--prefix-cache", action="store_true")
     ap.add_argument("--max-running", type=int, default=32)
     ap.add_argument("--native", action="store_true", help="use the zero-transformers native runner")
+    ap.add_argument("--quant", type=str, default=None, choices=["marlin"],
+                    help="可选 int4 量化扩展(降精度)。和 vLLM 对比时两边须同精度(int4 vs int4);"
+                         "默认 fp16 对比不受影响。仅 --native 支持。")
     ap.add_argument("--out", type=str, default="omniserve.json")
     args = ap.parse_args()
 
@@ -67,8 +70,10 @@ def main():
         # 原生快路径支持 prefix cache(复用整段 prefill);vision cache 仅 HF runner 支持。
         if vc is not None:
             print("[warn] --vision-cache 在 --native 下不支持(原生 ViT 无 monkeypatch 挂点),已忽略")
-        runner = NativeQwenVLRunner(max_running=args.max_running, prefix_cache=pc)
+        runner = NativeQwenVLRunner(max_running=args.max_running, prefix_cache=pc, quant=args.quant)
     else:
+        if args.quant is not None:
+            print("[warn] --quant 仅 --native 支持,已忽略")
         runner = QwenVLRunner(load_in_4bit=not args.fp16, vision_cache=vc, prefix_cache=pc)
     reqs = build(args.requests, reuse_rate=args.reuse)
 

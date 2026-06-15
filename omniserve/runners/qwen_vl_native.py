@@ -30,7 +30,7 @@ DEFAULT_SNAPSHOT = os.path.expanduser(
 
 class NativeQwenVLRunner(ModelRunner):
     def __init__(self, model_dir: str = None, max_running: int = 32, max_len: int = 1024,
-                 prefix_cache=None):
+                 prefix_cache=None, quant: str = None):
         model_dir = model_dir or glob.glob(DEFAULT_SNAPSHOT)[0]
         self.device = "cuda"
         self.tokenizer = Qwen2VLTokenizer(os.path.join(model_dir, "tokenizer.json"))
@@ -52,6 +52,13 @@ class NativeQwenVLRunner(ModelRunner):
         self.llm = Qwen2LLM(Qwen2Config()).half()
         load_from_hf(self.llm, sd)
         self.llm = self.llm.to(self.device).eval()
+        # 可选扩展:int4 Marlin 量化划算的大 GEMM(MLP gate_up/down)。默认 None=fp16。
+        # ⚠️ 降精度,只作框架量化能力展示——和 vLLM 的对比要同精度(int4 vs int4)。
+        self.quant = quant
+        if quant == "marlin":
+            from ..kernels.marlin_linear import quantize_llm_marlin
+            n = quantize_llm_marlin(self.llm)
+            print(f"[marlin] 量化 {n} 个 MLP 大 GEMM 为 int4(扩展特性,降精度)")
         del sd
         gc.collect()
         torch.cuda.empty_cache()

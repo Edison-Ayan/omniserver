@@ -51,8 +51,9 @@ def main():
     ap.add_argument("--prefix-cache", action="store_true")
     ap.add_argument("--max-running", type=int, default=32)
     ap.add_argument("--native", action="store_true", help="use the zero-transformers native runner")
-    ap.add_argument("--quant", type=str, default=None, choices=["marlin"],
-                    help="可选 int4 量化扩展(降精度)。和 vLLM 对比时两边须同精度(int4 vs int4);"
+    ap.add_argument("--quant", type=str, default=None, choices=["marlin", "gptq"],
+                    help="可选 int4 量化扩展(降精度)。marlin=在线 RTN(只 MLP);gptq=加载 vLLM 同款 "
+                         "GPTQ-Int4 校准权重(全 decoder,和 vLLM int4 同精度,用于公平对比)。"
                          "默认 fp16 对比不受影响。仅 --native 支持。")
     ap.add_argument("--out", type=str, default="omniserve.json")
     args = ap.parse_args()

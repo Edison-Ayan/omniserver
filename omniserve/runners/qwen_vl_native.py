@@ -30,7 +30,7 @@ DEFAULT_SNAPSHOT = os.path.expanduser(
 
 class NativeQwenVLRunner(ModelRunner):
     def __init__(self, model_dir: str = None, max_running: int = 32, max_len: int = 1024,
-                 prefix_cache=None, quant: str = None):
+                 prefix_cache=None, quant: str = None, gptq_dir: str = None):
         model_dir = model_dir or glob.glob(DEFAULT_SNAPSHOT)[0]
         self.device = "cuda"
         self.tokenizer = Qwen2VLTokenizer(os.path.join(model_dir, "tokenizer.json"))
@@ -40,26 +40,33 @@ class NativeQwenVLRunner(ModelRunner):
         # 预分配池,所以缓存的是池槽位的 KV 快照(不是 HF DynamicCache)。
         self.prefix_cache = prefix_cache
         self._img_keys: Dict[str, list] = {}
+        self.quant = quant
 
+        # quant="gptq":整模型从 GPTQ checkpoint 加载(ViT/embed/norm 是 fp16,decoder linear
+        # 是预量化 int4 → Marlin)。和 vLLM 的 GPTQ-Int4 同一份校准权重 → 同精度公平对比。
+        gptq = quant == "gptq"
+        src = (gptq_dir or "/tmp/gptq_model") if gptq else model_dir
         sd = {}
-        for f in glob.glob(os.path.join(model_dir, "model-*.safetensors")):
+        for f in glob.glob(os.path.join(src, "model*.safetensors")):
             sd.update(load_file(f))
 
         self.vit = Qwen2VIT()
-        load_vit_from_state_dict(self.vit, sd)
+        load_vit_from_state_dict(self.vit, sd)        # GPTQ 的 visual.* 也是 fp16
         self.vit = self.vit.half().to(self.device).eval()
 
-        self.llm = Qwen2LLM(Qwen2Config()).half()
-        load_from_hf(self.llm, sd)
-        self.llm = self.llm.to(self.device).eval()
-        # 可选扩展:int4 Marlin 量化划算的大 GEMM(MLP gate_up/down)。默认 None=fp16。
-        # ⚠️ 降精度,只作框架量化能力展示——和 vLLM 的对比要同精度(int4 vs int4)。
-        self.quant = quant
-        if quant == "marlin":
-            from ..kernels.marlin_linear import quantize_llm_marlin
-            # 默认 mlp 范围:在线 RTN(无校准)只对 MLP 鲁棒;全量化 qkv/o 会乱码,需 GPTQ 校准权重。
-            n = quantize_llm_marlin(self.llm, scope="mlp")
-            print(f"[marlin] 量化 {n} 个 MLP 大 GEMM 为 int4(扩展特性,降精度)")
+        self.llm = Qwen2LLM(Qwen2Config()).half().to(self.device)
+        if gptq:
+            from ..kernels.marlin_linear import load_gptq_llm
+            n = load_gptq_llm(self.llm, sd, self.device)
+            print(f"[gptq] 加载 {n} 个 GPTQ int4 GEMM(全 decoder,和 vLLM 同权重同精度)")
+        else:
+            load_from_hf(self.llm, sd)
+            if quant == "marlin":
+                # 在线 RTN(无校准)只对 MLP 鲁棒;全量化 qkv/o 会乱码,要全量化用 gptq。
+                from ..kernels.marlin_linear import quantize_llm_marlin
+                n = quantize_llm_marlin(self.llm, scope="mlp")
+                print(f"[marlin] 量化 {n} 个 MLP 大 GEMM 为 int4(在线 RTN,降精度)")
+        self.llm = self.llm.eval()
         del sd
         gc.collect()
         torch.cuda.empty_cache()

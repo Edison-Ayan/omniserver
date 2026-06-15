@@ -64,7 +64,10 @@ def main():
 
     if args.native:
         from omniserve.runners.qwen_vl_native import NativeQwenVLRunner
-        runner = NativeQwenVLRunner(max_running=args.max_running)
+        # 原生快路径支持 prefix cache(复用整段 prefill);vision cache 仅 HF runner 支持。
+        if vc is not None:
+            print("[warn] --vision-cache 在 --native 下不支持(原生 ViT 无 monkeypatch 挂点),已忽略")
+        runner = NativeQwenVLRunner(max_running=args.max_running, prefix_cache=pc)
     else:
         runner = QwenVLRunner(load_in_4bit=not args.fp16, vision_cache=vc, prefix_cache=pc)
     reqs = build(args.requests, reuse_rate=args.reuse)

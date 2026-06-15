@@ -51,6 +51,33 @@ class PreallocatedKVCache:
             self.v[li][dst].copy_(self.v[li][src])
         self.lengths[dst] = self.lengths[src]
 
+    # ---- prefix cache 支持:槽位 KV 的快照/恢复/复制 ------------------------
+    def snapshot_slot(self, slot: int, length: int):
+        """把某槽位前 `length` 个 token 的 KV 克隆出来(脱离池 buffer),供 prefix
+        cache 跨 step 保存。返回 (ks, vs):每层一个 [nkv, length, hd] 张量。"""
+        ks = [self.k[li][slot, :, :length, :].clone() for li in range(self.n_layers)]
+        vs = [self.v[li][slot, :, :length, :].clone() for li in range(self.n_layers)]
+        return ks, vs
+
+    def restore_slot(self, slot: int, snapshot, length: int) -> None:
+        """把一份快照(snapshot_slot 产物)写进某槽位,跳过整段 prefill。快照本身只读、
+        不被修改,所以同一快照能恢复到多个槽位、各自独立 decode。"""
+        ks, vs = snapshot
+        for li in range(self.n_layers):
+            self.k[li][slot, :, :length, :] = ks[li]
+            self.v[li][slot, :, :length, :] = vs[li]
+        self.lengths[slot] = length
+        self._active = max(self._active, slot + 1)
+
+    def copy_slot_kv(self, src: int, dst: int, length: int) -> None:
+        """池内槽位到槽位直接拷贝前 `length` 个 token 的 KV(batch 内同前缀去重用,
+        不必经过 clone 快照)。"""
+        for li in range(self.n_layers):
+            self.k[li][dst, :, :length, :] = self.k[li][src, :, :length, :]
+            self.v[li][dst, :, :length, :] = self.v[li][src, :, :length, :]
+        self.lengths[dst] = length
+        self._active = max(self._active, dst + 1)
+
     def view(self, n: int):
         """返回一个绑定到前 `n` 个活跃槽位的 cache view,供一次前向使用。"""
         return _CacheView(self, n)

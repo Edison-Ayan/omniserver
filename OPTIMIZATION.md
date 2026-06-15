@@ -32,6 +32,17 @@ Structural + kernel changes took the gap from **5.4x to 1.8x** on this
 > prefills as a separate phase. The benchmark numbers above are prefill-dominated
 > and hide the decode win.
 
+> ⚠️ **更正(2026-06-15,详见 探索日志.md 第 8、9 阶段)**:上面"gap 全在 prefill"被后续
+> measure 推翻。直接 head-to-head 测 vLLM 自己的 ViT(66ms/图 vs omniserve 73ms),**没有
+> "ViT GEMM 2x 护城河"**。之前的"prefill 慢 3x"是**基准的缓存不对称**:vLLM 默认开
+> 两层缓存(prefix KV + mm/encoder `mm_processor_cache_gb=4`),warmup 用同图把 prefill 全
+> 缓存住;omniserve 每 trial reset 冷跑。**公平对比(gen=64,24 请求,fp16):**
+> 真冷 omniserve **341** vs vLLM **290**(omniserve 快 1.18x);高复用 reuse0.9 omniserve+pc
+> **821** vs vLLM **1325**(vLLM 快 1.61x,差在 decode 的 CUDA graph,不在 prefill)。
+> 已落地:run_vllm 加 `--no-prefix-cache`+每 trial reset(P0);prefix cache 接到 native
+> 快路径(P1,reuse0.9 → 2.4x、零复用零开销、逐 token 一致)。**冷测真冷必须每 trial 用全新图**
+> (只关 prefix cache 仍有 mm cache 复用 ViT,会虚高到 498)。
+
 The rest is analyzed below.
 
 ---

@@ -26,6 +26,13 @@ def main():
     ap.add_argument("--reuse", type=float, default=0.0)
     ap.add_argument("--trials", type=int, default=3)
     ap.add_argument("--mem-util", type=float, default=0.9)  # fp16 权重 ~4.4GB;要给 KV 留余量
+    ap.add_argument("--no-prefix-cache", action="store_true",
+                    help="关掉 vLLM 的前缀缓存。默认它是开的,且 warmup 用同一批图会把整段 "
+                         "prefill 缓存住,计时 trial 全命中、跳过 ViT+prefill——这对每个 trial "
+                         "都冷跑的 omniserve 不公平。要做 apples-to-apples 的冷对比就加这个flag。"
+                         "⚠️ 注意 vLLM 还有第二层 mm/encoder cache(mm_processor_cache_gb=4 默认开),"
+                         "相同图即使关了 prefix cache 仍会复用 ViT(实测虚高到 498 vs 真冷 290 tok/s)。"
+                         "严格真冷需让每个 trial 用全新的图,见 探索日志.md 第 9 阶段。")
     ap.add_argument("--out", type=str, default="vllm.json")
     args = ap.parse_args()
 
@@ -45,7 +52,8 @@ def main():
     # 生产配置:CUDA graph 开(不用 enforce_eager)。mem-util 决定 KV 预留;
     # 我们设得适中,并把它当作**预留**报告,而不是实测工作集(见 README 说明)。
     llm = LLM(model=MODEL_ID, max_model_len=2048, gpu_memory_utilization=args.mem_util,
-              limit_mm_per_prompt={"image": 1}, dtype="float16")
+              limit_mm_per_prompt={"image": 1}, dtype="float16",
+              enable_prefix_caching=not args.no_prefix_cache)
     sp = SamplingParams(max_tokens=MAX_NEW_TOKENS, temperature=0.0)
 
     # 预热(编译 CUDA graph、填好 cache)—— 不计时
@@ -55,6 +63,10 @@ def main():
     trials = []
     sample_text = None
     for _ in range(args.trials):
+        # 和 omniserve 对称:前缀缓存开着时,每个计时 trial 前清掉它,这样不会跨
+        # warmup/trial 复用、把 prefill 白嫖掉(否则计的是缓存命中、不是真 prefill)。
+        if not args.no_prefix_cache:
+            llm.reset_prefix_cache()
         t0 = time.perf_counter()
         outs = llm.generate(inputs, sp)
         wall = time.perf_counter() - t0
@@ -68,6 +80,7 @@ def main():
     result = {
         "backend": "vLLM", "n_requests": args.requests, "trials": trials,
         "peak_mem_mib_torch": round(peak), "mem_util": args.mem_util,
+        "prefix_cache": not args.no_prefix_cache, "reset_each_trial": True,
         "sample_text": sample_text,
     }
     with open(args.out, "w") as f:

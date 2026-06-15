@@ -188,19 +188,26 @@ class NativeQwenVLRunner(ModelRunner):
         assert all(seqs[b].kv_handle["slot"] == b for b in range(n))
         dev = self.device
         view = self._pool.view(n)
-        wpos, ret = view.write_pos, view.ret_len
+        wpos = view.write_pos
         ids = torch.tensor([[s.last_token_id()] for s in seqs], device=dev)
         rope = torch.tensor([s.kv_handle["rope_delta"] for s in seqs], device=dev)
         pos = torch.empty(3, n, 1, device=dev, dtype=torch.long)
         pos[:, :, 0] = (wpos + rope).unsqueeze(0)
-        mask = torch.full((n, 1, 1, ret), float("-inf"), device=dev, dtype=torch.float16)
-        for b in range(n):
-            mask[b, 0, 0, : wpos[b] + 1] = 0.0
+        # decode 注意力走 view.flash_decode(用 seqused_k 表达各序列有效长度),不需要
+        # additive mask——以前逐序列 Python 循环构造的 mask 是死代码(qwen2_llm 的 flash
+        # 路径直接忽略 attn_mask),却每次 wpos[b] 切片触发 .item() 同步,纯 CPU launch 开销。
         emb = self.llm.embed_tokens(ids)
-        logits = self.llm(emb, pos, mask, view)[:, -1, :]
-        for b, seq in enumerate(seqs):
-            seq.append_token(self._sample(logits[b:b + 1], seq))
-            seq.maybe_finish()
+        logits = self.llm(emb, pos, None, view)[:, -1, :]
+        # 批量采样:全 greedy 时一次 argmax + 一次 tolist(1 次同步),替代逐序列 .item()(n 次)。
+        if all(s.request.sampling.greedy for s in seqs):
+            toks = logits.argmax(dim=-1).tolist()
+            for b, seq in enumerate(seqs):
+                seq.append_token(toks[b])
+                seq.maybe_finish()
+        else:
+            for b, seq in enumerate(seqs):
+                seq.append_token(self._sample(logits[b:b + 1], seq))
+                seq.maybe_finish()
 
     def free(self, seq: Sequence) -> None:
         slot = seq.kv_handle.get("slot")

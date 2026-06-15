@@ -178,15 +178,18 @@ class _CacheView:
         # 1) 新 token KV 原地写到 [slot, :, write_pos, :]
         pool.k[layer_idx][self._rows, :, self.write_pos, :] = key
         pool.v[layer_idx][self._rows, :, self.write_pos, :] = value
-        # 2) 转成 flash 的分页 block 布局 [num_blocks, block_size, nkv, hd]
-        kc = pool.k[layer_idx][:n].transpose(1, 2).contiguous()
-        vc = pool.v[layer_idx][:n].transpose(1, 2).contiguous()
+        # 2) 转成 flash 的分页 block 布局 [num_blocks, block_size, nkv, hd]。
+        #    只取有效长度 ret_len(而非整个 max_len)做 contiguous——序列才 ~300、池 max_len 1024,
+        #    省 ~3x 拷贝(每层都做,是 decode 大头之一)。block_size=ret_len,seqused_k 限制各序列有效长度。
+        R = min((self.ret_len + 15) // 16 * 16, pool.max_len)   # flash 要 block_size 是 16 倍数
+        kc = pool.k[layer_idx][:n, :, :R, :].transpose(1, 2).contiguous()
+        vc = pool.v[layer_idx][:n, :, :R, :].transpose(1, 2).contiguous()
         cu_q = torch.arange(0, n + 1, device=q.device, dtype=torch.int32)
         seqused_k = (self.write_pos + 1).to(torch.int32)
         block_table = self._rows.view(n, 1).to(torch.int32)
         out = flash_attn_varlen_func(
             q.contiguous(), kc, vc, max_seqlen_q=1, cu_seqlens_q=cu_q,
-            max_seqlen_k=pool.max_len, seqused_k=seqused_k, block_table=block_table,
+            max_seqlen_k=R, seqused_k=seqused_k, block_table=block_table,
             softmax_scale=scale, causal=False)            # [n, nh, hd]
         if layer_idx == pool.n_layers - 1:
             pool.lengths[:n] = self.write_pos + 1

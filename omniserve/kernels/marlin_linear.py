@@ -62,11 +62,18 @@ class MarlinInt4Linear(nn.Module):
                           self.N, self.K, is_k_full=True, bias=self.bias)
 
 
-def quantize_llm_marlin(model) -> int:
-    """把 LLM 每层 MLP 的 gate_up/down 换成 int4 Marlin(划算的大 GEMM)。返回替换的层数。
-    qkv/o 小 GEMM 不划算、lm_head tied 不动,都保持 fp16。"""
+def quantize_llm_marlin(model, scope: str = "decoder") -> int:
+    """把 LLM 的 Linear 换成 int4 Marlin。返回替换的 GEMM 数。
+    - scope="decoder"(默认,**和 vLLM GPTQ 同范围**):每层 qkv/o/gate_up/down 全量化,
+      lm_head + ViT 保持 fp16(标准 GPTQ 范围,公平对比用这个)。
+    - scope="mlp":只量化划算的大 GEMM(gate_up/down),qkv/o 保持 fp16
+      (micro-bench 上 qkv int4 0.85x、o 0.96x,选择性量化精度更高;但范围和 vLLM 不同)。"""
     n = 0
     for layer in model.layers:
+        if scope == "decoder":
+            layer.self_attn.qkv_proj = MarlinInt4Linear(layer.self_attn.qkv_proj)
+            layer.self_attn.o_proj = MarlinInt4Linear(layer.self_attn.o_proj)
+            n += 2
         layer.mlp.gate_up_proj = MarlinInt4Linear(layer.mlp.gate_up_proj)
         layer.mlp.down_proj = MarlinInt4Linear(layer.mlp.down_proj)
         n += 2

@@ -57,7 +57,8 @@ class NativeQwenVLRunner(ModelRunner):
         self.quant = quant
         if quant == "marlin":
             from ..kernels.marlin_linear import quantize_llm_marlin
-            n = quantize_llm_marlin(self.llm)
+            # 默认 mlp 范围:在线 RTN(无校准)只对 MLP 鲁棒;全量化 qkv/o 会乱码,需 GPTQ 校准权重。
+            n = quantize_llm_marlin(self.llm, scope="mlp")
             print(f"[marlin] 量化 {n} 个 MLP 大 GEMM 为 int4(扩展特性,降精度)")
         del sd
         gc.collect()

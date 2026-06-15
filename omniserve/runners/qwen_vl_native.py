@@ -72,10 +72,10 @@ class NativeQwenVLRunner(ModelRunner):
         gc.collect()
         torch.cuda.empty_cache()
 
-        # ⚠️ WIP:decode CUDA graph(消除 28 层 kernel 间 GPU 间隙,验证过 replay 快 1.16x)。
-        # KV 布局已改成 graph-friendly([B,max_len,nkv,hd] + 单维 index_copy_,索引/seqused 都图外
-        # 预算成 static buffer)。但 flash 的 paged read 在 graph replay 下仍有 illegal access 未解,
-        # 故默认 use_graph=False 走 eager。layout 重构本身已让 eager decode 12.6→11.8ms(免 transpose)。
+        # decode CUDA graph:消除 28 层 kernel 间的 GPU 调度间隙,decode 11.5→9.5ms(1.2x)、token 一致。
+        # 前提是 KV 布局 graph-friendly([B,max_len,nkv,hd] + 单维 index_copy_,flat/seqused 都图外
+        # 预算成 static buffer);关键坑:capture 用的 view 必须存活(存进 self._graphs),否则它的
+        # _rows 等 tensor 被 GC、内存被复用,replay 时 illegal access。
         self._use_graph = use_graph
         self._graphs: Dict[int, tuple] = {}  # n -> (graph, static_buffers)
         self._pending: Dict[str, dict] = {}
@@ -203,15 +203,15 @@ class NativeQwenVLRunner(ModelRunner):
         pos = torch.arange(L, device=ids.device).view(1, 1, -1).expand(3, 1, -1)
         return pos, torch.zeros(1, 1, device=ids.device)
 
-    @torch.inference_mode()
     def decode(self, seqs: List[Sequence]) -> None:
         seqs = sorted(seqs, key=lambda s: s.kv_handle["slot"])
         n = len(seqs)
         assert all(seqs[b].kv_handle["slot"] == b for b in range(n))
         if self._use_graph:
-            self._decode_graph(seqs, n)
+            self._decode_graph(seqs, n)        # CUDA graph 不能在 inference_mode 内 capture/replay
         else:
-            self._decode_eager(seqs, n)
+            with torch.inference_mode():
+                self._decode_eager(seqs, n)
 
     def _decode_eager(self, seqs, n):
         dev = self.device
@@ -264,13 +264,15 @@ class NativeQwenVLRunner(ModelRunner):
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             buf["logits"] = fwd()
-        self._graphs[n] = (g, buf)
+        # 必须把 view 一起存活——它的 _rows/_flat 等 tensor 被 captured graph 引用,
+        # 若 view 被 GC 这些内存会被释放/复用,replay 时 illegal access。
+        self._graphs[n] = (g, buf, view)
 
     def _decode_graph(self, seqs, n):
         dev = self.device
         if n not in self._graphs:
             self._capture_graph(n)
-        g, buf = self._graphs[n]
+        g, buf, _view = self._graphs[n]
         ids = torch.tensor([[s.last_token_id()] for s in seqs], device=dev)
         rope = torch.tensor([s.kv_handle["rope_delta"] for s in seqs], device=dev)
         lengths = self._pool.lengths[:n]

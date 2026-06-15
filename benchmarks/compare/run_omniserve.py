@@ -51,6 +51,7 @@ def main():
     ap.add_argument("--prefix-cache", action="store_true")
     ap.add_argument("--max-running", type=int, default=32)
     ap.add_argument("--native", action="store_true", help="use the zero-transformers native runner")
+    ap.add_argument("--cuda-graph", action="store_true", help="decode 走 CUDA graph(消除 kernel 间隙,~1.2x decode);仅 --native")
     ap.add_argument("--quant", type=str, default=None, choices=["marlin", "gptq"],
                     help="可选 int4 量化扩展(降精度)。marlin=在线 RTN(只 MLP);gptq=加载 vLLM 同款 "
                          "GPTQ-Int4 校准权重(全 decoder,和 vLLM int4 同精度,用于公平对比)。"
@@ -71,7 +72,7 @@ def main():
         # 原生快路径支持 prefix cache(复用整段 prefill);vision cache 仅 HF runner 支持。
         if vc is not None:
             print("[warn] --vision-cache 在 --native 下不支持(原生 ViT 无 monkeypatch 挂点),已忽略")
-        runner = NativeQwenVLRunner(max_running=args.max_running, prefix_cache=pc, quant=args.quant)
+        runner = NativeQwenVLRunner(max_running=args.max_running, prefix_cache=pc, quant=args.quant, use_graph=args.cuda_graph)
     else:
         if args.quant is not None:
             print("[warn] --quant 仅 --native 支持,已忽略")

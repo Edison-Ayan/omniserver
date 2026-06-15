@@ -205,8 +205,7 @@ class _CacheView:
         from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
         pool, n = self.pool, self.n
         self._write_kv(key, value, layer_idx)                  # graph 友好的单维写入
-        kc = pool.k[layer_idx][:n]                             # [n, max_len, nkv, hd] 直接喂,免拷贝
-        vc = pool.v[layer_idx][:n]
+        kc, vc = pool.k[layer_idx][:n], pool.v[layer_idx][:n]   # 直接喂 pool,免拷贝(eager+graph)
         cu_q = torch.arange(0, n + 1, device=q.device, dtype=torch.int32)
         seqused_k = self._seqused if self._graph else (self.write_pos + 1).to(torch.int32)
         block_table = self._rows.view(n, 1).to(torch.int32)

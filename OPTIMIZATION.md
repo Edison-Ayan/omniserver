@@ -45,6 +45,23 @@ Structural + kernel changes took the gap from **5.4x to 1.8x** on this
 
 The rest is analyzed below.
 
+> ## Final state (after the fair benchmark + phases 7–9 below)
+> The prefill-dominated trajectory table above is *historical*. With the benchmark
+> made fair (cold cache on fresh images) and three more decode optimizations
+> landed, the honest current numbers are:
+>
+> | traffic | precision | omniserve | vLLM | ratio |
+> |---|---|---|---|---|
+> | truly cold | fp16 | **372** | 290 | **1.28x — faster** |
+> | reuse 0.9 | fp16 | 1011 | 1325 | 0.76x |
+> | truly cold | int4 (GPTQ) | 421 | 453 | 0.93x |
+> | reuse 0.9 | int4 (GPTQ) | **1785** | 2186 | **0.82x** |
+>
+> The decode step went **16.4 → 9.5 ms (1.72x)** via §7–§8. The single most
+> valuable result is **§ The attribution** below: quantization moves the bottleneck
+> from a *hardware* floor (bandwidth, equal for both) to *engineering* (kernel
+> efficiency, vLLM's moat) — which is why omniserve wins at fp16 and trails at int4.
+
 ---
 
 ## 1. Batched decode — 53 → 172 tok/s (~3x)
@@ -137,6 +154,95 @@ help (§ below holds); the next lever is a **quantized GEMM** (Marlin/FP8), not 
 Reusing a production binary instead of fighting a compiler was the highest-leverage
 move of the whole project.
 
+## 7. FlashAttention decode-copy fix — decode 16.4 → 12.6 ms
+
+**Observation.** After §6, the remaining decode "moat" looked like a vLLM kernel
+advantage (omniserve 16.4 ms vs vLLM ~11 ms/step). It wasn't. `flash_decode`
+re-laid-out the KV every step, every layer: it `transpose + contiguous`'d the
+*entire* `[n, nkv, max_len=1024, hd]` pool slot into flash's block layout — but
+the real sequence was only ~300 tokens. We were copying **3x of useless padding**
+every layer.
+
+**Change.** Copy only `ret_len` (the used length, rounded up to a multiple of 16
+so flash's `block_size` divides it) instead of the whole `max_len`.
+
+**Result.** Decode **16.4 → 12.6 ms**, token-identical. This **falsified the "it's
+a vLLM kernel moat" story** for ~4 ms of the gap — that 4 ms was *our own* copy
+inefficiency. (Measure caught it again.) It helped every config, fp16 and int4:
+fp16-cold 341 → **372** (now 1.28x *faster* than vLLM), int4 reuse-0.9 0.54x →
+0.67x.
+
+## 8. KV-pool layout + CUDA graph — decode 12.6 → 9.5 ms (and "graphs are useless" overturned)
+
+§2's note said CUDA graphs were useless because decode was GPU-bound. That was a
+*stage-specific* truth, and §7 changed the stage. Two changes finished the job:
+
+**8-A. KV-pool layout `[B, max_len, nkv, hd]`.** The old pool was
+`[B, nkv, max_len, hd]`, so every layer transposed it into flash's block layout.
+Storing it *as* the block layout means decode reads `pool.k[:n]` directly — **no
+per-layer transpose** — and KV writes become a single-dim `index_copy_`
+(`flat = row*max_len + pos`), which is graph-friendly. Decode **12.6 → 11.5 ms**,
+token-identical.
+
+**8-B. CUDA-graph capture.** Even with the CPU keeping up, there are **GPU-side
+scheduling gaps between the 28 layers' kernels**. Capturing the decode step into a
+CUDA graph and replaying it erases those gaps: decode **11.5 → 9.5 ms (1.2x)**,
+token-identical. Whole decode chain: **16.4 → 12.6 (§7) → 11.5 (8-A) → 9.5 ms =
+1.72x.**
+
+> **The debugging lesson (worth more than the 1.2x).** Capture kept throwing
+> `illegal memory access` on replay. The usual suspects (flash, `index_put`,
+> in-place deps, `inference_mode`) were all innocent — capturing a single layer or
+> a full forward in isolation (`mg.py`) worked fine, so the bug was in the *engine
+> integration path*. Root cause: the `view` used during capture was a **local
+> variable**; after the capture function returned it was GC'd, and the internal
+> tensors (`_rows` etc.) that the captured graph still referenced had their memory
+> reused → illegal access on replay. Fix: keep the view alive
+> (`self._graphs[n] = (g, buf, view)`). Two more gotchas: buffer-dependent indices
+> (`flat`/`seqused`) must be pre-computed *outside* the graph into static buffers;
+> and you cannot capture a graph inside `@torch.inference_mode()`.
+
+## 9. int4 quantization (Marlin / GPTQ) — optional, apples-to-apples
+
+To compare against *vLLM-int4* honestly (not int4-vs-fp16), omniserve loads the
+**same production GPTQ-Int4 weights vLLM uses** and repacks them to Marlin
+(`omniserve/kernels/marlin_linear.py`): `gptq_marlin_repack` for the packed
+qweight + scales, fused qkv/gate_up concatenated along N. Default stays fp16, so
+the fp16 comparison is never a quantization cheat.
+
+| traffic | omniserve GPTQ | vLLM-int4 | ratio |
+|---|---|---|---|
+| truly cold | 421 | 453 | 0.93x |
+| reuse 0.9 (+prefix cache) | 1785 | 2186 | **0.82x** (was 0.54x before §7–§8) |
+
+Two debugging notes worth keeping: (1) you must load each layer's **two RMSNorms**
+— leave them at the init `ones` and the proj unit-tests still pass but the whole
+model outputs garbage (bisect layer-by-layer to find it); (2) **don't pass `bias`
+into `gptq_marlin_gemm`** (wrong result, rel-err 0.90) — add it outside the kernel
+(rel-err 0.0002).
+
+The same-precision int4 result still trails vLLM, and *why* is the project's punchline:
+
+## ⭐ The attribution — the gap moves between layers when you quantize
+
+This is the single most valuable conclusion. The residual gap is not a bug, not a
+correctness issue, and not in a fixed place — **it migrates as precision changes,
+and we can say exactly where and why:**
+
+| | decode bottleneck | prefill bottleneck |
+|---|---|---|
+| **fp16** | weight-read **bandwidth** (a hardware floor, ~16 ms, *equal for both*) → omniserve's leaner path **wins** | **ViT** (both fp16, 66 vs 73 ms/img, close) → omniserve's leaner scheduling edges it |
+| **int4** | **kernel efficiency** (weight reads drop to ~1/4, floor ~4 ms; omniserve 9.5 ms / vLLM ~7–8 ms are *both far above* it) → vLLM's fused kernels + CUDA graph show → vLLM **wins** | vLLM also quantizes the **LLM** prefill and overlaps it (290 → 453); omniserve stays bottlenecked on **serial per-image ViT** (372 → 421) → overtaken |
+
+**Quantization didn't make omniserve slower — it made vLLM's engineering advantage
+*visible*.** At fp16 both engines sit on the same hardware floor (bandwidth, ViT
+compute), so the lean from-scratch engine wins. Quantization removes those equal
+floors and exposes the layer where vLLM has years of work omniserve doesn't:
+fused decode kernels, a full CUDA graph over the whole step, and overlapped
+batched prefill. Being able to name *which* layer the gap lives in, *why* it moved
+there, and *what* (kernel fusion + prefill overlap) would close it — is a stronger
+result than a single tuned throughput number.
+
 ## Why vLLM is fast — the compounding chain (nsys evidence)
 
 We profiled both engines' decode with Nsight Systems (`scripts/prof_decode.py`,
@@ -154,14 +260,20 @@ omniserve's decode GPU time: **GEMM 55% + attention 20% + elementwise 19%** (the
 
 **The key is that it compounds.** A standalone data point: vLLM with `enforce_eager`
 (no CUDA graphs) does **293 tok/s**; with CUDA graphs, **503 tok/s** — graphs alone
-are **1.7x**. Yet on omniserve we measured CUDA graphs as *useless* (§ below). The
-resolution:
+are **1.7x**. At the time, on omniserve we measured CUDA graphs as *useless*. The
+resolution *as it stood then*:
 
 > Fast kernels (FlashAttention + fused) make each step's GPU time **short enough
 > that kernel launch becomes the bottleneck** → the engine is *launch-bound* → CUDA
 > graphs erase that launch overhead → +1.7x. omniserve's slower kernels (SDPA + KV
 > materialization) keep each step **GPU-bound**, so the CPU already keeps up and
 > graphs do nothing.
+
+> **Refined later (§8):** "CPU keeps up ⇒ graphs do nothing" was incomplete. After
+> §7's copy fix, a graph still bought **1.2x** by collapsing the **GPU-side gaps
+> between layer kernels** — a separate effect from CPU launch overhead. So graphs
+> help via *two* mechanisms (launch overhead **and** inter-kernel GPU gaps); only
+> the first was absent on omniserve, not the second.
 
 So vLLM's speed is a chain where each link enables the next:
 
@@ -170,11 +282,16 @@ So vLLM's speed is a chain where each link enables the next:
 3. **1 + 2 ⇒ launch-bound ⇒ CUDA graphs** add 1.7x;
 4. **PagedAttention** — no KV waste ⇒ larger batches ⇒ weight reads amortized further.
 
-omniserve is stuck at **link 1**: SDPA can't give GQA-native *and* fast (we tried
-`enable_gqa` — slower, see below), so the KV materialization stays, the step is
-GPU-bound, and the whole compounding chain never starts. The first link,
-FlashAttention, is precisely what requires a custom CUDA kernel that the HF/SDPA
-stack does not provide — which is why the remaining gap lives at the kernel layer.
+When this was first written, omniserve was stuck at **link 1**: SDPA can't give
+GQA-native *and* fast (we tried `enable_gqa` — slower, see below), so the step
+stayed GPU-bound. **§6–§8 then walked the chain anyway:** link 1 by reusing vLLM's
+flash binary (GQA-native, no KV materialization), and link 3 by getting the CUDA
+graph to capture (once §7's copy fix and §8-A's layout exposed the inter-kernel
+gaps). What omniserve still lacks is vLLM's **fused decode kernels** (norm + rope +
+residual + quant collapsed into fewer kernels) and **PagedAttention-scale batching**
+— which is exactly why the residual gap only becomes visible under quantization
+(see *The attribution* above): at fp16 the bandwidth floor hides it; at int4 it
+doesn't.
 
 ---
 
@@ -182,11 +299,16 @@ stack does not provide — which is why the remaining gap lives at the kernel la
 
 Knowing when to stop is half the work. Each of these was rejected *with data*.
 
-### CUDA graphs — measured useless after the prealloc pool
-After preallocation, a back-to-back (no-sync) decode loop ran at the same speed
-as a synced one (ratio **1.02**) → the step is now **GPU-bound, not launch-bound**.
-CUDA graphs remove launch/CPU overhead; there is none left to remove. (Before the
-pool, at 15k launches, it would have helped — the pool moved the bottleneck.)
+### CUDA graphs — first measured useless, later done anyway (§8)
+After preallocation, a back-to-back (no-sync) decode loop ran at the same speed as
+a synced one (ratio **1.02**) → the step was **GPU-bound, not launch-bound**, so
+removing CPU/launch overhead bought nothing. **This conclusion didn't survive §7.**
+Once the decode-copy fix and KV-layout change cut the step to 11.5 ms, profiling
+showed the remaining cost included **GPU-side gaps between the 28 layers' kernels**
+— which a captured graph *does* erase (11.5 → 9.5 ms, 1.2x). Lesson: "no launch
+overhead to remove" ≠ "no graph benefit"; a graph also collapses inter-kernel GPU
+scheduling gaps, and *which* effect dominates depends on the current bottleneck.
+(Kept here, not deleted, because the wrong-then-right arc is the point.)
 
 ### SDPA `enable_gqa` to drop the KV materialization — measured *slower*
 nsys flagged the GQA `repeat_interleave` (materializing `[B,2,L,D]→[B,12,L,D]`
@@ -215,22 +337,33 @@ different fp16 kernel, is the Ada-specific lever for bandwidth-bound decode.
 
 ---
 
-## Where the remaining 2.3x is
+## Where the remaining gap is (and where it isn't)
 
-| gap source | vLLM | omniserve | tractable here? |
-|---|---|---|---|
-| quantized GEMM kernel (decode-dominant) | Marlin / FP8 fused | fp16 / bnb (slower) | hard — needs Marlin or an FP8 path |
-| sequential prefill (~48% of time) | chunked/batched | one-at-a-time | medium |
-| paged attention | dedicated kernel | preallocated pool (most of the win) | mostly done |
-| fused attention (FlashAttention, GQA-native) | yes | SDPA + KV materialization | hard — custom kernel, the chain's first link |
-| in-layer fused kernels (QKV/gate_up/SiLU/add+norm) | yes | **done (§5)** — but +2% (Amdahl) | — |
-| lean C++ forward | yes | our Python forward | hard — a rewrite |
+The gap that was once "2.3x, everywhere" has been **localized**. What used to be
+self-inflicted inefficiency is fixed; what's left is vLLM's specialized engineering,
+and only at int4:
 
-The character of the gap changed over this work: it started as **self-inflicted
-inefficiency** (O(L²) KV rebuild, launch storms) that was fixable, and now is
-mostly **specialized kernels and a rewritten forward** — years of engineering, not
-a bug. The reuse-heavy multimodal path (prefix/vision cache) is where omniserve
-has a real, differentiated story rather than chasing vLLM's general-purpose speed.
+| gap source | status |
+|---|---|
+| O(L²) KV rebuild / launch storms | **fixed** — preallocated pool (§2) |
+| GQA KV materialization | **fixed** — FlashAttention, GQA-native (§6) |
+| decode-copy of padded `max_len` | **fixed** — copy only used length (§7) |
+| per-layer KV transpose | **fixed** — pool stored as flash's block layout (§8-A) |
+| inter-kernel GPU scheduling gaps | **fixed** — CUDA-graph decode (§8-B) |
+| quantized GEMM (apples-to-apples vs vLLM-int4) | **done** — GPTQ→Marlin (§9) |
+| **fused decode kernels** (norm+rope+residual+quant in fewer kernels) | **vLLM-only** — ~the int4 decode gap (9.5 vs ~7–8 ms); years of kernel work |
+| **overlapped batched prefill** (chunked, ViT batched + prefill/decode overlap) | **vLLM-only** — the int4 cold-prefill gap; omniserve runs ViT serially per image |
+| varlen / chunked-mixed prefill (fp16 too) | **omniserve TODO** — block-diagonal path written, needs varlen flash |
+| lean C++ forward | not pursued — a rewrite, marginal given the above |
+
+The honest bottom line: **at fp16, on a fair benchmark, the from-scratch engine is
+not slower — it's faster on cold traffic** (§ Final state). The residual gap is an
+**int4-only** phenomenon and lives in two named places — fused decode kernels and
+overlapped prefill — i.e. vLLM's mature kernel/scheduler engineering, not a bug or
+a structural flaw. The reuse-heavy multimodal path (prefix/vision cache) remains
+omniserve's own differentiated story. Knowing exactly which two layers remain, and
+why they only surface under quantization, is the result — not a number to keep
+grinding on an 8 GB laptop.
 
 ---
 

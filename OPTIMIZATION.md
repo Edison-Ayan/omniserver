@@ -78,7 +78,7 @@ multimodal-specific wrinkle — positions are 3-D (t/h/w), so the text-only batc
 decode path doesn't transfer directly.
 
 **Verification.** Token-identical to per-sequence decode for equal- and
-ragged-length batches (`scripts/proto_batched_decode.py`).
+ragged-length batches (`scripts/archive/proto_batched_decode.py`).
 
 ## 2. Preallocated KV pool — 172 → 220 tok/s (+28% e2e, +15% decode)
 
@@ -97,7 +97,7 @@ custom kernel.
 
 **Result.** Kernels/step **15.2k → 3.1k** (5x fewer); decode **+15%**, end-to-end
 **+28%** (it cut both launch overhead and HBM traffic). Token-identical incl.
-staggered finishes (`scripts/proto_prealloc_kv.py`). Also produces the **static
+staggered finishes (`scripts/archive/proto_prealloc_kv.py`). Also produces the **static
 shapes** a CUDA graph would need.
 
 ## 3. Multimodal caching (reuse-heavy traffic)

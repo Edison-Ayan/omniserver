@@ -1,7 +1,8 @@
 """Qwen2-VL-2B 的 VLMAdapter:ViT + Qwen2 LLM + M-RoPE + 图像切块 + chat 模板。
 
 把原来散在 NativeQwenVLRunner 里的"模型怎么算"全收进这一个 adapter;通用 MultimodalRunner
-只认 VLMAdapter 接口。支持 fp16(默认)/ marlin(在线 RTN int4,只 MLP)/ gptq(加载 GPTQ-Int4 校准权重)。
+只认 VLMAdapter 接口。支持 fp16(默认)/ marlin(在线 RTN int4,只 MLP)/ gptq(加载 GPTQ-Int4
+校准权重)/ mixed(per-op 混合精度:MLP=FP8 + attention=fp16,见 kernels/mixed_precision.py)。
 """
 
 from __future__ import annotations
@@ -57,6 +58,10 @@ class Qwen2VLAdapter(VLMAdapter):
                 from ..kernels.marlin_linear import quantize_llm_marlin
                 n = quantize_llm_marlin(self._llm, scope="mlp")
                 print(f"[marlin] 量化 {n} 个 MLP 大 GEMM 为 int4(在线 RTN,降精度)")
+            elif quant == "mixed":
+                from ..kernels.mixed_precision import apply_mixed
+                plan = apply_mixed(self._llm)
+                print(f"[mixed] per-op 混合精度(每算子 精度×层数):{plan}")
         self._llm = self._llm.eval()
         del sd
         gc.collect()
@@ -114,4 +119,4 @@ class Qwen2VLAdapter(VLMAdapter):
         return self._tokenizer.decode(token_ids)
 
     def supports_quant(self, quant):
-        return quant in (None, "marlin", "gptq")
+        return quant in (None, "marlin", "gptq", "mixed")

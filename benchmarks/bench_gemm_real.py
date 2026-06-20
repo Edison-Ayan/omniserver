@@ -108,11 +108,11 @@ def quality(out, ref):
     return rel.item(), cos.item()
 
 
-def grab_real_weights_and_acts(layer_idx: int):
-    """加载真实模型,抓 layer_idx 的真实激活,返回融合权重 + 真实激活,然后释放模型。"""
-    from transformers import AutoTokenizer, Qwen2VLForConditionalGeneration
-    print(f"加载 {MODEL_ID}(fp16)...")
-    tok = AutoTokenizer.from_pretrained(MODEL_ID)
+def grab_real_weights_and_acts(layer_idx: int, use_image: bool = False, image_path: str = None):
+    """加载真实模型,抓 layer_idx 的真实激活,返回融合权重 + 真实激活,然后释放模型。
+    use_image=True:喂真实图文(走 ViT,激活含图像 token);image_path 给则用真实照片,否则合成几何图。"""
+    from transformers import Qwen2VLForConditionalGeneration
+    print(f"加载 {MODEL_ID}(fp16)... [{'图文' if use_image else '纯文本'}]")
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         MODEL_ID, dtype=torch.float16, device_map="cuda").eval()
     layer = model.model.language_model.layers[layer_idx]
@@ -128,12 +128,31 @@ def grab_real_weights_and_acts(layer_idx: int):
         layer.mlp.gate_proj.register_forward_pre_hook(pre_hook("gate_up")),  # gate_up 输入
         layer.mlp.down_proj.register_forward_pre_hook(pre_hook("down")),     # SwiGLU 中间激活
     ]
-    ids = tok(PROMPT, return_tensors="pt").input_ids.to("cuda")
     with torch.no_grad():
-        model(input_ids=ids)
+        if use_image:  # 真实图文:processor 处理图片 + 文本,完整 forward(含 ViT)
+            from transformers import AutoProcessor
+            if image_path:  # 真实照片
+                from PIL import Image
+                img = Image.open(image_path).convert("RGB")
+                img.thumbnail((1024, 1024))  # 限分辨率:超大图会让 ViT(O(N²))撑爆 8GB
+                print(f"  真实照片:{image_path} -> {img.size}")
+            else:           # 项目端到端 bench 同款合成几何图
+                sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "compare"))
+                from _workload import make_image
+                img = make_image(0)
+            proc = AutoProcessor.from_pretrained(MODEL_ID)
+            msgs = [{"role": "user", "content": [{"type": "image"},
+                     {"type": "text", "text": "Describe this image in detail."}]}]
+            text = proc.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+            inputs = proc(text=[text], images=[img], return_tensors="pt").to("cuda")
+            model(**inputs)
+        else:  # 纯文本
+            from transformers import AutoTokenizer
+            ids = AutoTokenizer.from_pretrained(MODEL_ID)(PROMPT, return_tensors="pt").input_ids.to("cuda")
+            model(input_ids=ids)
     for h in hs:
         h.remove()
-    print(f"真实激活 M(prefill 长度)= {acts['qkv'].shape[0]}")
+    print(f"真实激活 M = {acts['qkv'].shape[0]}")
 
     sa, mlp = layer.self_attn, layer.mlp
     # 按 omniserve 融合顺序拼真实权重(qkv=[q,k,v]、gate_up=[gate,up])

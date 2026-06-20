@@ -27,20 +27,23 @@ _ATTR = {
 
 
 def _replace(layer, op: str, prec: str) -> int:
-    """把单层的一个算子换成指定精度。fp16=不动,返回是否替换(0/1)。"""
+    """把单层的一个算子换成指定精度。fp16=不动,返回是否替换(0/1)。
+    精度可带 "+h" 后缀(如 "fp8+h"/"marlin+h")开启 Hadamard 旋转(默认关,outlier 重时才用)。"""
     sub, attr = _ATTR[op]
     parent = getattr(layer, sub)
     lin = getattr(parent, attr)
-    if prec == "fp16":
+    had = prec.endswith("+h")
+    base = prec[:-2] if had else prec
+    if base == "fp16":
         return 0
-    if prec == "fp8":
+    if base == "fp8":
         from .fp8_linear import FP8Linear
-        setattr(parent, attr, FP8Linear.from_linear(lin))
-    elif prec == "marlin":
+        setattr(parent, attr, FP8Linear.from_linear(lin, hadamard=had))
+    elif base == "marlin":
         from .marlin_linear import MarlinInt4Linear
-        setattr(parent, attr, MarlinInt4Linear(lin))
+        setattr(parent, attr, MarlinInt4Linear(lin, hadamard=had))
     else:
-        raise ValueError(f"未知精度 {prec!r}(支持 fp16/fp8/marlin)")
+        raise ValueError(f"未知精度 {prec!r}(支持 fp16/fp8/marlin,可带 +h 后缀)")
     return 1
 
 

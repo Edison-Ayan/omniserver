@@ -53,6 +53,9 @@ class _MarlinBase(nn.Module):
 
     def forward(self, x):
         m = _marlin_api()
+        if getattr(self, "hadamard", False):       # 激活在线旋转(权重侧已离线吸收 W·H)
+            from .hadamard import rotate
+            x = rotate(x)
         # bias 在 Marlin kernel 外手动加(实测把 bias 传进 gptq_marlin_gemm 结果不对)
         out = m["apply"](x, self.qweight, self.scales, self.zp, self.g_idx, self.sort_indices,
                          self.workspace, m["stype"], self.N, self.K, is_k_full=True)
@@ -62,12 +65,17 @@ class _MarlinBase(nn.Module):
 class MarlinInt4Linear(_MarlinBase):
     """在线 RTN 量化一个 fp16 nn.Linear(无校准)。"""
 
-    def __init__(self, linear: nn.Linear, group_size: int = 128):
+    def __init__(self, linear: nn.Linear, group_size: int = 128, hadamard: bool = False):
         super().__init__()
         m = _marlin_api()
         dev = linear.weight.device
         N, K = linear.weight.shape                 # nn.Linear 权重 [out, in]
-        w = linear.weight.data.t().contiguous()    # marlin_quantize 要 [size_k, size_n]
+        wd = linear.weight.data
+        if hadamard:                               # 离线吸收 W·H(在 K 维旋转,再量化)
+            from .hadamard import rotate
+            wd = rotate(wd)
+        self.hadamard = hadamard
+        w = wd.t().contiguous()                    # marlin_quantize 要 [size_k, size_n]
         _, qw, s, _, _, _ = m["quantize"](w, m["stype"], group_size, False)
         self._register(qw, s, linear.bias, N, K, dev)
 

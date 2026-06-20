@@ -46,8 +46,12 @@ def quant_fp8(x):
 class FP8Linear(nn.Module):
     """nn.Linear 的 FP8 替代:权重 e4m3(per-channel scale),激活动态 FP8。"""
 
-    def __init__(self, weight: torch.Tensor, bias=None):
+    def __init__(self, weight: torch.Tensor, bias=None, hadamard: bool = False):
         super().__init__()
+        self.hadamard = hadamard
+        if hadamard:                                          # 离线吸收 W·H(旋转后再量化)
+            from .hadamard import rotate
+            weight = rotate(weight)
         self.N, self.K = weight.shape
         wscale = (weight.abs().amax(1, keepdim=True) / 448.0).float()  # [N,1]
         self.register_buffer("wq", (weight / wscale).to(E4M3))         # [N,K]
@@ -55,12 +59,15 @@ class FP8Linear(nn.Module):
         self.bias = bias
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear) -> "FP8Linear":
+    def from_linear(cls, linear: nn.Linear, hadamard: bool = False) -> "FP8Linear":
         """从 fp16 nn.Linear 构造,和 MarlinInt4Linear(linear) 用法对齐(per-op 替换用)。"""
-        return cls(linear.weight.data, linear.bias)
+        return cls(linear.weight.data, linear.bias, hadamard=hadamard)
 
     def forward(self, x):
         shape = x.shape
+        if self.hadamard:                                    # 激活在线旋转 a·H
+            from .hadamard import rotate
+            x = rotate(x)
         xq, xs = quant_fp8(x)
         out = torch._scaled_mm(xq, self.wq.t(), scale_a=xs, scale_b=self.wscale,
                                out_dtype=torch.bfloat16)

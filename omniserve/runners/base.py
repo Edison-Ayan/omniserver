@@ -42,6 +42,12 @@ class ModelRunner(abc.ABC):
         prefill 预算时才会走到这里。"""
         raise NotImplementedError("此 runner 不支持 chunked prefill;请调大 max_prefill_tokens")
 
+    def mixed_step(self, chunk_seq: Sequence, decode_seqs: List[Sequence]) -> None:
+        """mixed batching:把 chunk prefill 和 decode 拼进同一次前向。默认退化成两次独立前向
+        (先算块、再 decode),语义完全相同;支持 mixed 的后端可重写以省一次 launch + 喂饱 GEMM。"""
+        self.chunk_prefill(chunk_seq)
+        self.decode(decode_seqs)
+
     @abc.abstractmethod
     def detokenize(self, seq: Sequence, new_token_ids: List[int]) -> str:
         """把新产生的 token id 渲染成文本,用于流式输出。"""

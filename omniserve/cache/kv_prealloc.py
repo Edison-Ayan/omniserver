@@ -107,6 +107,44 @@ class PreallocatedKVCache:
         decode(1 个 query token)和 prefill-chunk(L 个)本质同一个 append 注意力,这里 L 任意。"""
         return _ChunkedPrefillWriter(self, slot, start)
 
+    def mixed_cache(self, slots, new_lens, starts):
+        """mixed batching 的 cache 适配器:一次前向里 decode(每序列 1 个新 token)和
+        prefill-chunk(L 个)混在一起。各序列把新 KV append 到自己槽位 start 处,再一次 varlen
+        append 注意力(block_table 分页读池、段间独立)。decode 是 new_len=1 的特例,chunk 是 L。
+        slots/new_lens/starts:各序列的 槽位 / 本步新增 query 数 / 写入起点(=该序列当前 KV 长度)。"""
+        return _MixedWriter(self, slots, new_lens, starts)
+
+
+class _MixedWriter:
+    def __init__(self, pool: PreallocatedKVCache, slots, new_lens, starts):
+        self.pool, self.slots, self.new_lens, self.starts = pool, slots, new_lens, starts
+
+    def flash_prefill(self, q, k, v, layer_idx, scale):
+        """q/k/v: [sum(new_lens), nh/nkv, hd](decode token 在前、chunk 块在后,rope 已应用)。
+        各序列新 KV 写进自己槽位 [start:start+new_len];varlen append 注意力,每序列注意到
+        [0:start+new_len](自己的 prefix + 本步新 token,causal),段间互不注意。"""
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+        pool, dev = self.pool, q.device
+        off = 0
+        for slot, nl, st in zip(self.slots, self.new_lens, self.starts):
+            pool.k[layer_idx][slot, st:st + nl, :, :] = k[off:off + nl]
+            pool.v[layer_idx][slot, st:st + nl, :, :] = v[off:off + nl]
+            off += nl
+        cu_q = torch.zeros(len(self.slots) + 1, device=dev, dtype=torch.int32)
+        cu_q[1:] = torch.tensor(self.new_lens, device=dev, dtype=torch.int32).cumsum(0)
+        seqused_k = torch.tensor([st + nl for st, nl in zip(self.starts, self.new_lens)],
+                                 device=dev, dtype=torch.int32)
+        block_table = torch.tensor(self.slots, device=dev, dtype=torch.int32).view(-1, 1)
+        out = flash_attn_varlen_func(
+            q.contiguous(), pool.k[layer_idx], pool.v[layer_idx],
+            max_seqlen_q=max(self.new_lens), cu_seqlens_q=cu_q,
+            max_seqlen_k=pool.max_len, seqused_k=seqused_k, block_table=block_table,
+            softmax_scale=scale, causal=True)                 # [sum(new_lens), nh, hd]
+        if layer_idx == pool.n_layers - 1:
+            for slot, nl, st in zip(self.slots, self.new_lens, self.starts):
+                pool.lengths[slot] = st + nl
+        return out
+
 
 class _ChunkedPrefillWriter:
     def __init__(self, pool: PreallocatedKVCache, slot: int, start: int):

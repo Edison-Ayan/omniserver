@@ -56,10 +56,13 @@ class LLMEngine:
 
         if out.prefill:
             self.runner.prefill(out.prefill)
-        if out.prefill_chunk is not None:
-            self.runner.chunk_prefill(out.prefill_chunk)
-        if out.decode:
-            self.runner.decode(out.decode)
+        if out.prefill_chunk is not None and out.decode:
+            # Phase B:有 chunk 又有 decode -> 拼进同一次前向(mixed batching)
+            self.runner.mixed_step(out.prefill_chunk, out.decode)
+        elif out.prefill_chunk is not None:
+            self.runner.chunk_prefill(out.prefill_chunk)   # 没有 decode 时纯算块
+        elif out.decode:
+            self.runner.decode(out.decode)                 # 纯 decode(可走 CUDA graph)
 
         # 收集本步动过的每个序列新流出的 token。
         touched = (*out.prefill,

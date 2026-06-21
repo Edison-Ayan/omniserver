@@ -164,6 +164,58 @@ class MultimodalRunner(ModelRunner):
         seq.append_token(self._sample(logits[:, -1, :], seq))
         seq.maybe_finish()
 
+    @torch.inference_mode()
+    def mixed_step(self, chunk_seq: Sequence, decode_seqs: List[Sequence]) -> None:
+        """Phase B mixed batching:把"长 prompt 的这一块 prefill"和"在跑序列的 decode token"
+        拼进**同一次前向**(一个 GEMM + 一次 append 注意力),省两次 launch、把 decode 的小 M
+        GEMM 喂饱。decode(1 token)和 chunk(L token)由 cu_seqlens_q 分段、各自注意自己的 KV。"""
+        dev = self.device
+        decode_seqs = sorted(decode_seqs, key=lambda s: s.kv_handle["slot"])
+        n = len(decode_seqs)
+        assert all(decode_seqs[b].kv_handle["slot"] == b for b in range(n))
+        R = self._reserve_slot
+        m = self._pending[chunk_seq.request_id]
+        ids_full = m["ids"]
+        start = chunk_seq.num_prefilled
+        L = chunk_seq.prefill_chunk
+        end = start + L
+        if start == 0:
+            assert m["pixel_values"] is None, "chunked prefill 暂只支持纯文本长 prompt(无图)"
+            pos_full, delta = self.adapter.prefill_positions(ids_full, m["grids"])
+            chunk_seq.kv_handle = {"slot": R, "rope_delta": delta, "pos_full": pos_full}
+        pos_full = chunk_seq.kv_handle["pos_full"]
+
+        # 打包输入:decode 各 1 token 在前,chunk 的 L 个 token 在后(B=1, L_total=n+L)
+        dec_lengths = self._pool.lengths[:n].clone()                      # 写入位置 = 当前 KV 长度
+        dec_rope = torch.tensor([s.kv_handle["rope_delta"] for s in decode_seqs], device=dev)
+        dec_ids = torch.tensor([[s.last_token_id()] for s in decode_seqs], device=dev)
+        dec_pos = self.adapter.decode_positions(dec_lengths, dec_rope)    # [3, n, 1]
+        dec_emb = self.adapter.embed_tokens(dec_ids)                      # [n, 1, hidden]
+        chunk_emb = self.adapter.embed_tokens(ids_full[:, start:end])     # [1, L, hidden]
+        emb = torch.cat([dec_emb.reshape(1, n, -1), chunk_emb], dim=1)    # [1, n+L, hidden]
+        pos = torch.cat([dec_pos.reshape(3, 1, n), pos_full[:, :, start:end]], dim=2)  # [3,1,n+L]
+
+        slots = list(range(n)) + [R]
+        new_lens = [1] * n + [L]
+        starts = [int(dec_lengths[b]) for b in range(n)] + [start]
+        cache = self._pool.mixed_cache(slots, new_lens, starts)
+        final = end == chunk_seq.num_prompt_tokens
+        # 取 logits:每个 decode token 的位置 + (最后一块时)chunk 末 token
+        logits_idx = list(range(n)) + ([n + L - 1] if final else [])
+        logits = self.adapter.llm(emb, pos, None, cache, logits_indices=logits_idx)[0]  # [len,vocab]
+
+        self._emit(decode_seqs, logits[:n])                              # decode 各吐一个(lengths 由 writer 更新)
+        chunk_seq.num_prefilled = end
+        if final:                                                        # 最后一块:落位 decode 区 + 吐首 token
+            n_dec = len(self._slot_seq)
+            self._pool.move_slot(R, n_dec)
+            chunk_seq.kv_handle = {"slot": n_dec, "rope_delta": chunk_seq.kv_handle["rope_delta"]}
+            self._slot_seq.append(chunk_seq)
+            self._pending.pop(chunk_seq.request_id, None)
+            self._img_keys.pop(chunk_seq.request_id, None)
+            chunk_seq.append_token(self._sample(logits[n:n + 1], chunk_seq))
+            chunk_seq.maybe_finish()
+
     def decode(self, seqs: List[Sequence]) -> None:
         seqs = sorted(seqs, key=lambda s: s.kv_handle["slot"])
         n = len(seqs)

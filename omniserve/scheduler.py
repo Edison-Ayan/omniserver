@@ -28,8 +28,9 @@ class SchedulerConfig:
 @dataclass
 class SchedulerOutput:
     """本次迭代引擎该执行的内容。"""
-    prefill: List[Sequence] = field(default_factory=list)  # 需要做 prefill
+    prefill: List[Sequence] = field(default_factory=list)  # 整段一次 prefill(短 prompt,可打包)
     decode: List[Sequence] = field(default_factory=list)    # 前进一个 token
+    prefill_chunk: "Sequence | None" = None  # 分块 prefill 中的长 prompt(这一步算一块)
 
 
 class Scheduler:
@@ -54,37 +55,63 @@ class Scheduler:
 
     def schedule(self) -> SchedulerOutput:
         out = SchedulerOutput()
+        budget = self.config.max_prefill_tokens
 
         # 1) 把跑完/被中止的序列从 running 集合里退休掉(腾出槽位)。
         self.running = [s for s in self.running if s.status == Status.RUNNING]
 
-        # 2) 在还有 batch 容量时准入等待中的序列(prefill)。
-        #    打包式 prefill:一步可以准入多个 prompt 打进一次前向,受两个上限约束——
-        #    数量上限 max_prefill_per_step,和 token 预算 max_prefill_tokens(总 prompt
-        #    token 数不超预算;至少准入一个,避免超长 prompt 永远进不来)。
-        admitted = 0
-        used_tokens = 0
-        while (
-            self.waiting
-            and len(self.running) < self.config.max_running
-            and admitted < self.config.max_prefill_per_step
-        ):
-            seq = self.waiting[0]
-            n_tok = seq.num_prompt_tokens
-            # 已经打包了至少一个、再加这个会超预算 -> 这步先不收
-            if admitted > 0 and used_tokens + n_tok > self.config.max_prefill_tokens:
-                break
-            self.waiting.popleft()
-            if seq.status == Status.ABORTED:
-                continue
-            seq.status = Status.RUNNING
-            self.running.append(seq)
-            out.prefill.append(seq)
-            admitted += 1
-            used_tokens += n_tok
+        # 2) chunked prefill 优先:若有长 prompt 正在分块 prefill(num_prefilled 没满),
+        #    这一步继续算它的下一块(每步最多 budget 个 token),decode 照常进行不被阻塞。
+        inflight = next(
+            (s for s in self.running if s.num_prefilled < s.num_prompt_tokens), None)
+        if inflight is not None:
+            inflight.prefill_chunk = min(
+                inflight.num_prompt_tokens - inflight.num_prefilled, budget)
+            out.prefill_chunk = inflight
+        else:
+            # 3) 准入等待中的序列做整段 prefill。受数量上限 max_prefill_per_step 和 token 预算约束。
+            #    例外:单个 prompt 比预算还长 -> 走分块 prefill(独占这一步,不和别人打包),
+            #    这样它不会一次算完整段把正在跑的 decode 堵住。
+            admitted = 0
+            used_tokens = 0
+            while (
+                self.waiting
+                and len(self.running) < self.config.max_running
+                and admitted < self.config.max_prefill_per_step
+            ):
+                seq = self.waiting[0]
+                n_tok = seq.num_prompt_tokens
+                if n_tok > budget:                       # 长 prompt -> 分块路径
+                    if admitted > 0:
+                        break                            # 先把本步打包的短 prompt 跑完,下步再开它
+                    self.waiting.popleft()
+                    if seq.status == Status.ABORTED:
+                        continue
+                    seq.status = Status.RUNNING
+                    self.running.append(seq)
+                    seq.prefill_chunk = min(n_tok, budget)
+                    out.prefill_chunk = seq
+                    break
+                # 已经打包了至少一个、再加这个会超预算 -> 这步先不收
+                if admitted > 0 and used_tokens + n_tok > budget:
+                    break
+                self.waiting.popleft()
+                if seq.status == Status.ABORTED:
+                    continue
+                seq.status = Status.RUNNING
+                self.running.append(seq)
+                seq.num_prefilled = n_tok                # 整段一次 prefill,准入即视作 prefill 完成
+                out.prefill.append(seq)
+                admitted += 1
+                used_tokens += n_tok
 
-        # 3) 其余每个 running 序列前进一个 decode token。
-        out.decode = [s for s in self.running if s not in out.prefill]
+        # 4) 其余 prefill 已完成的 running 序列前进一个 decode token
+        #    (排除本步在做 prefill 的:整段的 out.prefill、分块的 out.prefill_chunk)。
+        out.decode = [
+            s for s in self.running
+            if s is not out.prefill_chunk and s not in out.prefill
+            and s.num_prefilled >= s.num_prompt_tokens
+        ]
         return out
 
     def free_finished(self) -> List[Sequence]:

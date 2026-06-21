@@ -61,6 +61,12 @@ class Sequence:
     # prefill 时产生(或 cache 命中拿到)的 vision token embedding。
     vision_embeds: Optional[object] = None
 
+    # chunked prefill:已 prefill 的 prompt token 数(< num_prompt_tokens 表示还在分块 prefill 中)。
+    # 整段一次 prefill 的序列在准入时就被置成 num_prompt_tokens;长 prompt 逐块累加。
+    num_prefilled: int = 0
+    # 调度器写、runner 读:这一步要 prefill 多少个 token(分块 prefill 用)。
+    prefill_chunk: int = 0
+
     # 流式记账:已经发给客户端多少个 output token。
     num_streamed: int = 0
 

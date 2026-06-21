@@ -56,11 +56,16 @@ class LLMEngine:
 
         if out.prefill:
             self.runner.prefill(out.prefill)
+        if out.prefill_chunk is not None:
+            self.runner.chunk_prefill(out.prefill_chunk)
         if out.decode:
             self.runner.decode(out.decode)
 
         # 收集本步动过的每个序列新流出的 token。
-        for seq in (*out.prefill, *out.decode):
+        touched = (*out.prefill,
+                   *((out.prefill_chunk,) if out.prefill_chunk is not None else ()),
+                   *out.decode)
+        for seq in touched:
             new_ids = seq.output_token_ids[seq.num_streamed:]
             if new_ids:
                 text = self.runner.detokenize(seq, new_ids)

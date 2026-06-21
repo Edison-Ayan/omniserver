@@ -101,6 +101,40 @@ class PreallocatedKVCache:
         update 时把每段的 KV 切出来写进对应槽位。块对角 mask 保证段间互不注意。"""
         return _PackedPrefillWriter(self, slots, seg_lengths)
 
+    def chunked_prefill_cache(self, slot, start):
+        """分块 prefill 的 cache 适配器:把一块新 token 的 KV 追加写到 slot 的 [start:start+L],
+        注意力 append 式——这块的 query 注意到 slot 里 [0:start+L] 的全部 KV(已缓存 prefix + 本块)。
+        decode(1 个 query token)和 prefill-chunk(L 个)本质同一个 append 注意力,这里 L 任意。"""
+        return _ChunkedPrefillWriter(self, slot, start)
+
+
+class _ChunkedPrefillWriter:
+    def __init__(self, pool: PreallocatedKVCache, slot: int, start: int):
+        self.pool, self.slot, self.start = pool, slot, start
+
+    def flash_prefill(self, q, k, v, layer_idx, scale):
+        """q/k/v: [L, nh/nkv, hd](本块 token,rope 已应用)。本块 KV 写进 pool[slot,start:start+L],
+        query append 式注意到 pool[slot, 0:start+L](prefix + 本块,causal)。用 block_table + seqused_k
+        分页读池,和 flash_decode 同一套(decode 是 L=1 的特例)。"""
+        from vllm.vllm_flash_attn.flash_attn_interface import flash_attn_varlen_func
+        pool, slot, start = self.pool, self.slot, self.start
+        L = q.shape[0]
+        end = start + L
+        pool.k[layer_idx][slot, start:end, :, :] = k          # 本块 KV 直接写槽位
+        pool.v[layer_idx][slot, start:end, :, :] = v
+        cu_q = torch.tensor([0, L], device=q.device, dtype=torch.int32)
+        seqused_k = torch.tensor([end], device=q.device, dtype=torch.int32)
+        block_table = torch.tensor([[slot]], device=q.device, dtype=torch.int32)
+        out = flash_attn_varlen_func(
+            q.contiguous(), pool.k[layer_idx], pool.v[layer_idx],
+            max_seqlen_q=L, cu_seqlens_q=cu_q,
+            max_seqlen_k=pool.max_len, seqused_k=seqused_k, block_table=block_table,
+            softmax_scale=scale, causal=True)                 # [L, nh, hd]
+        if layer_idx == pool.n_layers - 1:
+            pool.lengths[slot] = end
+            pool._active = max(pool._active, slot + 1)
+        return out
+
 
 class _PackedPrefillWriter:
     def __init__(self, pool: PreallocatedKVCache, slots, seg_lengths):

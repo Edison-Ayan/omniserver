@@ -36,6 +36,12 @@ class ModelRunner(abc.ABC):
     def decode(self, seqs: List[Sequence]) -> None:
         """用每个在跑序列的 KV 句柄,把它前进恰好一个 token。"""
 
+    def chunk_prefill(self, seq: Sequence) -> None:
+        """分块 prefill 一个长 prompt 的下一块(seq.prefill_chunk 个 token);算完最后一块时
+        吐首 token。只有支持 chunked prefill 的后端才需要重写;调度器仅在 prompt 超过每步
+        prefill 预算时才会走到这里。"""
+        raise NotImplementedError("此 runner 不支持 chunked prefill;请调大 max_prefill_tokens")
+
     @abc.abstractmethod
     def detokenize(self, seq: Sequence, new_token_ids: List[int]) -> str:
         """把新产生的 token id 渲染成文本,用于流式输出。"""

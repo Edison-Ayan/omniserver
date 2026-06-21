@@ -29,8 +29,11 @@ class MultimodalRunner(ModelRunner):
         self._use_graph = use_graph
         self._graphs: Dict[int, tuple] = {}
         self._pending: Dict[str, dict] = {}
+        # 多预留 1 个槽位(索引 max_running)给"正在分块 prefill 的长 prompt",和 decode 区
+        # [0, n_dec) 完全隔离;分块算完再一次性 move 进 decode 区。
+        self._reserve_slot = max_running
         self._pool = PreallocatedKVCache(
-            n_layers=adapter.num_layers, max_batch=max_running, n_kv_heads=adapter.num_kv_heads,
+            n_layers=adapter.num_layers, max_batch=max_running + 1, n_kv_heads=adapter.num_kv_heads,
             max_len=max_len, head_dim=adapter.head_dim, device=self.device, dtype=torch.float16)
         self._slot_seq: List[Sequence] = []
 
@@ -126,6 +129,40 @@ class MultimodalRunner(ModelRunner):
             seq.kv_handle = {"slot": slot, "rope_delta": rope_delta}
             seq.append_token(tok)
             seq.maybe_finish()
+
+    @torch.inference_mode()
+    def chunk_prefill(self, seq: Sequence) -> None:
+        """长 prompt 分块 prefill:每步算一块,append 到保留槽位 R(和 decode 区隔离),
+        算完最后一块时吐首 token、把 KV 从 R 一次性 move 进 decode 区转为普通 decode 序列。
+        期间正在跑的 decode 不被整段 prefill 阻塞(stall 被摊到多步)。MVP:纯文本路径。"""
+        dev = self.device
+        R = self._reserve_slot
+        m = self._pending[seq.request_id]
+        ids_full = m["ids"]                                   # [1, num_prompt]
+        start = seq.num_prefilled
+        L = seq.prefill_chunk
+        end = start + L
+        if start == 0:                                        # 首块:整段 M-RoPE 位置算一次,后续块切片复用
+            assert m["pixel_values"] is None, "chunked prefill 暂只支持纯文本长 prompt(无图)"
+            pos_full, delta = self.adapter.prefill_positions(ids_full, m["grids"])
+            seq.kv_handle = {"slot": R, "rope_delta": delta, "pos_full": pos_full}
+        pos_full = seq.kv_handle["pos_full"]
+        emb = self.adapter.embed_tokens(ids_full[:, start:end])           # [1, L, hidden]
+        pos_chunk = pos_full[:, :, start:end]                             # [3, 1, L]
+        cache = self._pool.chunked_prefill_cache(R, start)
+        logits = self.adapter.llm(emb, pos_chunk, None, cache, logits_indices=[L - 1])
+        seq.num_prefilled = end
+        if end < seq.num_prompt_tokens:
+            return                                            # 还没算完,下步继续
+        # 最后一块:落位到 decode 区(move 一次)+ 吐首 token
+        n_dec = len(self._slot_seq)
+        self._pool.move_slot(R, n_dec)
+        seq.kv_handle = {"slot": n_dec, "rope_delta": seq.kv_handle["rope_delta"]}
+        self._slot_seq.append(seq)
+        self._pending.pop(seq.request_id, None)
+        self._img_keys.pop(seq.request_id, None)
+        seq.append_token(self._sample(logits[:, -1, :], seq))
+        seq.maybe_finish()
 
     def decode(self, seqs: List[Sequence]) -> None:
         seqs = sorted(seqs, key=lambda s: s.kv_handle["slot"])

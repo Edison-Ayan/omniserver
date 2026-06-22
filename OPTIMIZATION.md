@@ -112,7 +112,9 @@ measured in-engine, cold cache per trial:
 
 The vision cache only skips the ViT (a small slice of prefill); the prefix cache
 reuses the *entire* prefill KV on an exact (prompt tokens + image content) match —
-the lever vLLM's prefix cache / SGLang's radix cache pull.
+the lever vLLM's prefix cache / SGLang's radix cache pull. **Extended in §12 to
+longest-prefix (block-level) matching** so shared-prefix/different-suffix traffic
+(same image, different question) reuses the prefix KV too — image 17x.
 
 ## 4. Fused Triton RMSNorm — kernel 1.8–8.5x, e2e +1%
 
@@ -210,6 +212,11 @@ To compare against *vLLM-int4* honestly (not int4-vs-fp16), omniserve loads the
 qweight + scales, fused qkv/gate_up concatenated along N. Default stays fp16, so
 the fp16 comparison is never a quantization cheat.
 
+> Reproduce the weights: `python scripts/make_gptq_model.py` downloads the official
+> `Qwen/Qwen2-VL-2B-Instruct-GPTQ-Int4` (the same int4 weights vLLM users load);
+> `--self-quantize` re-runs AutoGPTQ on the base model (bits=4, group=128, sym,
+> desc_act=False, damp=0.1) to reproduce the original `/tmp/gptq_model` exactly.
+
 | traffic | omniserve GPTQ | vLLM-int4 | ratio |
 |---|---|---|---|
 | truly cold | 421 | 453 | 0.93x |
@@ -222,6 +229,81 @@ into `gptq_marlin_gemm`** (wrong result, rel-err 0.90) — add it outside the ke
 (rel-err 0.0002).
 
 The same-precision int4 result still trails vLLM, and *why* is the project's punchline:
+
+## 10. Per-op mixed precision — the speed×quality Pareto (FP8 MLP + fp16 attention)
+
+There is no single best precision; the optimum is **roofline (bandwidth vs compute,
+set by the GEMM's M) ⊕ numerical sensitivity**, applied *per operator*
+(`omniserve/kernels/mixed_precision.py`). Default plan: `gate_up`/`down` → FP8
+(W8A8, big-N GEMMs, FP8 takes 2x compute), `qkv`/`o` → fp16 (small GEMMs where FP8
+*loses* at M=24, plus attention is sensitivity-critical).
+
+Pareto (16 reqs, gen 64, vs fp16; `benchmarks/compare/pareto.py`):
+
+| config | tok/s | quality loss % | peak MiB |
+|---|---|---|---|
+| fp16 | 345.9 | 0 | 5058 |
+| **mixed** (FP8 MLP) | **398.8** | **5.93** | 3956 |
+| marlin (RTN int4, MLP) | 375.2 | 20.43 | 3422 |
+| gptq (int4 all-decoder) | 397.7 | 19.76 | 3204 |
+
+**mixed now matches gptq's throughput (398.8 ≈ 397.7) at ~1/3 the quality loss**
+and opens a low-loss region int4 can't reach; marlin (RTN) is Pareto-dominated by gptq.
+
+> ⚠️ **per-tensor vs rowwise FP8 (measured correction).** The first `FP8Linear`
+> used rowwise (per-token act + per-channel weight, `_scaled_mm` → bf16 → cast fp16).
+> End-to-end that was *slower in prefill than fp16* — the bf16→fp16 cast over the big
+> `gate_up` output [M, 17920] + per-token quant eat the GEMM win on a 2B model
+> (`benchmarks/bench_fp8_overhead.py` isolates it: rowwise 0.63–0.83x, per-tensor
+> 1.0–1.77x). Switching to **per-tensor** (scalar scales, `_scaled_mm` emits fp16
+> directly) lifted mixed from 354.8 → **398.8 tok/s**. Rowwise stays opt-in for heavy
+> outliers; text activations don't need it (rel 0.0143 vs 0.0147, measured).
+
+> ⚠️ **attention FP8 — measured *not* worth it.** Quantizing `qkv`/`o` to FP8 (W8A8),
+> even stage-aware (FP8 prefill / fp16 decode, `StageFP8Linear`), gives no net win on
+> this model: decode ≈ mixed, prefill ≤ mixed, memory unchanged. The micro-bench
+> "FP8 wins prefill" holds for the isolated GEMM but is erased end-to-end by per-token
+> quant + dtype-cast overhead at this scale. Keep `qkv`/`o` at fp16.
+
+## 11. Chunked + mixed prefill — long prompts stop stalling decode
+
+Each step was `prefill(whole) → decode(1 each)` as two forwards; a long prompt
+arriving mid-stream prefills in one shot and stalls in-flight decodes (ITL spike).
+Two pieces (`scheduler.py`, `runners/multimodal.py`, `cache/kv_prealloc.py`):
+**chunked** splits a long prompt into ≤budget-token chunks across steps; **mixed
+batching** fuses the prefill chunk + the decode tokens into *one* forward (one GEMM +
+one varlen append attention, `cu_seqlens_q` tags per-seq token counts: decode=1,
+chunk=L). The append attention unifies decode (L=1 special case) and prefill-chunk.
+
+Measured (`bench_chunked_prefill.py`, 920-tok prompt injected into 6 decoders,
+chunk=128): peak step **146ms → 39ms** (chunked) **→ 33ms** (mixed) = **4.39x** stall
+reduction; long-prompt output bit-identical to whole-prompt prefill.
+
+## 12. Prefix cache — longest-prefix matching (text 3.3x, image 17x)
+
+The prefix cache was **exact whole-prompt match only**; "shared prefix, different
+suffix" (same document/system prompt + different question; in multimodal, same image
++ different question) hit 0% and re-prefilled everything. Added **block-level
+longest-prefix matching** (`cache/prefix.py`): chained per-block hashes (block=16);
+`match_prefix` finds the longest shared block-prefix; a hit **restores the shared
+prefix KV and only prefills the suffix** — reusing the §11 append primitive (all
+partial suffixes batched into one `_MixedWriter` forward).
+
+| workload | exact-only (now) | longest-prefix | speedup |
+|---|---|---|---|
+| text (shared 115-tok prefix + diff suffix) | 119.8 ms / 0% hit | 36.3 ms / 100% | **3.30x** |
+| **image (same image + diff question)** | 785.7 ms / 0% | 46.1 ms / 100% | **17.04x** |
+
+Image wins far bigger: image tokens are ~87% of the prompt and the heaviest KV, so
+"same image, many questions" — the most common vision-serving pattern — now reuses
+the image KV instead of recomputing it. Multimodal correctness needs two things:
+fold the **image content hash** into the block hashes (placeholder token ids are all
+identical, else different images collide), and require the **suffix to contain no
+image tokens** (image fully inside the reused prefix → suffix is pure text, reused
+image KV is complete). First tokens are bit-identical to full recompute.
+
+This is the core of vLLM prefix caching / SGLang radix cache (incl. multimodal),
+which the project previously explicitly did not do.
 
 ## ⭐ The attribution — the gap moves between layers when you quantize
 
@@ -353,7 +435,7 @@ and only at int4:
 | quantized GEMM (apples-to-apples vs vLLM-int4) | **done** — GPTQ→Marlin (§9) |
 | **fused decode kernels** (norm+rope+residual+quant in fewer kernels) | **vLLM-only** — ~the int4 decode gap (9.5 vs ~7–8 ms); years of kernel work |
 | **overlapped batched prefill** (chunked, ViT batched + prefill/decode overlap) | **vLLM-only** — the int4 cold-prefill gap; omniserve runs ViT serially per image |
-| varlen / chunked-mixed prefill (fp16 too) | **omniserve TODO** — block-diagonal path written, needs varlen flash |
+| varlen / chunked-mixed prefill (fp16 too) | **done (§11)** — varlen append attention; chunked + mixed batching, 4.39x ITL stall reduction |
 | lean C++ forward | not pursued — a rewrite, marginal given the above |
 
 The honest bottom line: **at fp16, on a fair benchmark, the from-scratch engine is

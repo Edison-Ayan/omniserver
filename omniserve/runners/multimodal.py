@@ -77,6 +77,15 @@ class MultimodalRunner(ModelRunner):
                 entry = self.prefix_cache.get(keys[i], lambda x: x)
                 if entry is not None:
                     plan.append(("hit", entry)); continue
+                # 部分前缀复用(纯文本):和缓存共享最长块前缀 → 复用前缀 KV、只 prefill 后缀。
+                # MVP 限纯文本:图文要对齐图像块 + M-RoPE,留后续。
+                if self._pending[seq.request_id]["pixel_values"] is None:
+                    from ..cache.prefix import BLOCK
+                    mp = self.prefix_cache.match_prefix(seq.prompt_token_ids)
+                    if mp is not None and BLOCK <= mp[1] < seq.num_prompt_tokens:
+                        plan.append(("partial", mp))
+                        self.prefix_cache.stats.hits += 1
+                        continue
                 first_compute[keys[i]] = i
             plan.append(("compute", None))
             compute_idxs.append(i)
@@ -105,15 +114,49 @@ class MultimodalRunner(ModelRunner):
             for j, i in enumerate(compute_idxs):
                 first_tok[i] = self._sample(logits[j:j + 1], seqs[i])
                 if keys[i] is not None:
-                    from ..cache.prefix import PrefixEntry
+                    from ..cache.prefix import PrefixEntry, block_hashes
                     self.prefix_cache.put(keys[i], PrefixEntry(
                         cache=self._pool.snapshot_slot(slots[i], L_of[i]),
-                        rope_delta=delta_of[i], length=L_of[i], first_token=first_tok[i]))
+                        rope_delta=delta_of[i], length=L_of[i], first_token=first_tok[i],
+                        block_hashes=block_hashes(seqs[i].prompt_token_ids)))
+
+        # 2b) 部分前缀命中:恢复各自共享前缀 KV[0:matched],把所有后缀**打包进一次 append 前向**
+        #     (复用 _MixedWriter:每段后缀注意到自己槽位里已恢复的前缀,段间独立)——避免逐序列小前向。
+        partial_idxs = [i for i, (k, _) in enumerate(plan) if k == "partial"]
+        if partial_idxs:
+            p_emb, p_pos, p_slots, p_new, p_starts, last_idx = [], [], [], [], [], []
+            off = 0
+            for i in partial_idxs:
+                entry, matched = plan[i][1]
+                seq, slot = seqs[i], slots[i]
+                ids = self._pending[seq.request_id]["ids"]
+                L = ids.shape[1]; L_of[i] = L
+                ks, vs = entry.cache                                      # 切前缀 KV[0:matched] 写进槽位
+                self._pool.restore_slot(
+                    slot, ([k[:matched] for k in ks], [v[:matched] for v in vs]), matched)
+                pos_full, delta = self.adapter.prefill_positions(ids, None)
+                delta_of[i] = delta
+                p_emb.append(self.adapter.embed_tokens(ids[:, matched:]))  # 只算后缀
+                p_pos.append(pos_full[:, :, matched:])
+                p_slots.append(slot); p_new.append(L - matched); p_starts.append(matched)
+                off += L - matched; last_idx.append(off - 1)
+            cache = self._pool.mixed_cache(p_slots, p_new, p_starts)       # 一次打包 append 前向
+            logits = self.adapter.llm(torch.cat(p_emb, dim=1), torch.cat(p_pos, dim=2),
+                                      None, cache, logits_indices=last_idx)[0]
+            from ..cache.prefix import PrefixEntry, block_hashes
+            for j, i in enumerate(partial_idxs):
+                seq = seqs[i]
+                first_tok[i] = self._sample(logits[j:j + 1], seq)
+                if keys[i] is not None:
+                    self.prefix_cache.put(keys[i], PrefixEntry(
+                        cache=self._pool.snapshot_slot(slots[i], L_of[i]), rope_delta=delta_of[i],
+                        length=L_of[i], first_token=first_tok[i],
+                        block_hashes=block_hashes(seq.prompt_token_ids)))
 
         # 3) 落位
         for i, seq in enumerate(seqs):
             kind = plan[i][0]
-            if kind == "compute":
+            if kind in ("compute", "partial"):
                 slot, rope_delta, tok = slots[i], delta_of[i], first_tok[i]
             elif kind == "dup":
                 src = plan[i][1]

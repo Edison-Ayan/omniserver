@@ -24,6 +24,22 @@ from typing import List, Optional
 from .vision import CacheStats
 
 
+BLOCK = 16  # 最长前缀匹配的块粒度(对齐到块,避免半块匹配)
+
+
+def block_hashes(token_ids: List[int]) -> List[str]:
+    """累积块哈希:h_i 唯一标识 prompt 的前 (i+1)*BLOCK 个 token 这一段前缀
+    (链式:h_i = hash(h_{i-1}, 第 i 块的 token))。只算满块,尾部不足一块不计。
+    两个 prompt 的前缀块哈希一路相同 ⟺ 它们的 token 前缀逐位相同(忽略碰撞)。"""
+    hs, parent = [], b""
+    for i in range(len(token_ids) // BLOCK):
+        h = hashlib.sha1(parent)
+        h.update(repr(tuple(token_ids[i * BLOCK:(i + 1) * BLOCK])).encode())
+        parent = h.digest()
+        hs.append(h.hexdigest())
+    return hs
+
+
 @dataclass
 class PrefixEntry:
     """不重跑 prefill 就能恢复一个序列所需的全部信息。"""
@@ -31,6 +47,7 @@ class PrefixEntry:
     rope_delta: int      # prefill 时产生的 Qwen2-VL M-RoPE delta
     length: int          # prompt token 数(KV 长度)
     first_token: int     # 从 prefill logits 采样出的 token
+    block_hashes: Optional[List[str]] = None  # 用于最长前缀匹配的累积块哈希
 
 
 class PrefixKVCache:
@@ -71,6 +88,33 @@ class PrefixKVCache:
         while len(self._store) > self.max_entries:
             self._store.popitem(last=False)
             self.stats.evictions += 1
+
+    def match_prefix(self, token_ids: List[int]):
+        """最长前缀匹配:在缓存里找和 token_ids 共享最长**块前缀**的 entry。
+        返回 (entry, matched_len) —— matched_len 是对齐到块的可复用 token 数:
+          == len 整段       → 精确命中(整段 KV 可复用,跳过 prefill);
+          0 < matched < len → 部分命中(复用前 matched 个 token 的 KV,只 prefill 后缀);
+          0(返回 None)     → 无可复用前缀。
+        正确性:块哈希链一路相同 ⟺ token 前缀逐位相同,复用 KV[0:matched] 安全(因果注意力下
+        前 matched 个 token 的 KV 不依赖其后的 token)。"""
+        bh = block_hashes(token_ids)
+        if not bh:
+            return None
+        best, best_n = None, 0
+        for entry in self._store.values():
+            ebh = entry.block_hashes
+            if not ebh:
+                continue
+            n = 0
+            for a, b in zip(bh, ebh):
+                if a != b:
+                    break
+                n += 1
+            if n > best_n:
+                best, best_n = entry, n
+        if best_n == 0:
+            return None
+        return best, best_n * BLOCK
 
     def clear(self) -> None:
         """清空所有 entry 并重置统计(用于冷启动 benchmark)。"""

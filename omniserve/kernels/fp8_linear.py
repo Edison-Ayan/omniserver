@@ -44,37 +44,95 @@ def quant_fp8(x):
 
 
 class FP8Linear(nn.Module):
-    """nn.Linear 的 FP8 替代:权重 e4m3(per-channel scale),激活动态 FP8。"""
+    """nn.Linear 的 FP8 替代:权重 e4m3,激活动态 FP8。
 
-    def __init__(self, weight: torch.Tensor, bias=None, hadamard: bool = False):
+    默认 **per-tensor**(权重/激活各一个标量 scale,`_scaled_mm` 直接出 fp16):文本激活 outlier
+    不重(项目已测 rowwise≈per-tensor,rel 0.0143 vs 0.0147),而 per-tensor 快得多——micro-bench
+    隔离显示 rowwise(per-token + bf16→fp16 转换)在 prefill M 上**比 fp16 还慢 0.63–0.83x**,
+    per-tensor 才是 **1.0–1.77x**。`rowwise=True` 留给真有重 outlier 的场景(代价是 prefill 反亏)。"""
+
+    def __init__(self, weight: torch.Tensor, bias=None, hadamard: bool = False,
+                 rowwise: bool = False):
         super().__init__()
         self.hadamard = hadamard
+        self.rowwise = rowwise
         if hadamard:                                          # 离线吸收 W·H(旋转后再量化)
             from .hadamard import rotate
             weight = rotate(weight)
         self.N, self.K = weight.shape
-        wscale = (weight.abs().amax(1, keepdim=True) / 448.0).float()  # [N,1]
-        self.register_buffer("wq", (weight / wscale).to(E4M3))         # [N,K]
-        self.register_buffer("wscale", wscale.t().contiguous())        # [1,N]
+        if rowwise:                                           # 权重 per-channel
+            wscale = (weight.abs().amax(1, keepdim=True) / 448.0).float()  # [N,1]
+            self.register_buffer("wq", (weight / wscale).to(E4M3))        # [N,K]
+            self.register_buffer("wscale", wscale.t().contiguous())       # [1,N]
+        else:                                                 # 权重 per-tensor(标量 scale)
+            wscale = (weight.abs().max() / 448.0).float()                 # 标量
+            self.register_buffer("wq", (weight / wscale).to(E4M3))        # [N,K]
+            self.register_buffer("wscale", wscale)
         self.bias = bias
 
     @classmethod
-    def from_linear(cls, linear: nn.Linear, hadamard: bool = False) -> "FP8Linear":
+    def from_linear(cls, linear: nn.Linear, hadamard: bool = False,
+                    rowwise: bool = False) -> "FP8Linear":
         """从 fp16 nn.Linear 构造,和 MarlinInt4Linear(linear) 用法对齐(per-op 替换用)。"""
-        return cls(linear.weight.data, linear.bias, hadamard=hadamard)
+        return cls(linear.weight.data, linear.bias, hadamard=hadamard, rowwise=rowwise)
 
     def forward(self, x):
         shape = x.shape
         if self.hadamard:                                    # 激活在线旋转 a·H
             from .hadamard import rotate
             x = rotate(x)
-        xq, xs = quant_fp8(x)
-        out = torch._scaled_mm(xq, self.wq.t(), scale_a=xs, scale_b=self.wscale,
-                               out_dtype=torch.bfloat16)
-        out = out.to(torch.float16)
+        if self.rowwise:                                     # per-token 激活,_scaled_mm 只支持 bf16 输出
+            xq, xs = quant_fp8(x)
+            out = torch._scaled_mm(xq, self.wq.t(), scale_a=xs, scale_b=self.wscale,
+                                   out_dtype=torch.bfloat16).to(torch.float16)
+        else:                                                # per-tensor 激活,直接出 fp16(省转换)
+            x2d = x.reshape(-1, self.K)
+            sa = (x2d.abs().max() / 448.0).float()
+            xq = (x2d / sa).to(E4M3)
+            out = torch._scaled_mm(xq, self.wq.t(), scale_a=sa, scale_b=self.wscale,
+                                   out_dtype=torch.float16)
         if self.bias is not None:
             out = out + self.bias
-        return out.reshape(*shape[:-1], -1)
+        return out.reshape(*shape[:-1], self.N)
+
+
+class StageFP8Linear(nn.Module):
+    """按激活 M 维自适应精度(roofline 驱动的逐前向切换):
+      M ≥ 阈值(prefill / chunk / mixed,算力受限)→ FP8 W8A8(吃 2x 算力);
+      M <  阈值(decode,带宽受限,小 GEMM FP8 反而慢)→ fp16。
+    存 **fp16 权重**(decode 直接用、显存中性),FP8 路径**在线量化权重**(大 M 把这点开销摊掉)。
+    把"qkv/o 该 prefill FP8、decode fp16"那条 micro-bench 结论直接编码进 kernel——prefill/chunk/
+    mixed_step(M=n+L)自动走 FP8、纯 decode(M=batch)自动走 fp16,不需要调度器告诉它现在哪个阶段。
+    ⚠️ 因为 decode 要 fp16 权重,这条**不省 qkv/o 显存**(是吞吐导向,不是显存导向)。"""
+
+    def __init__(self, linear: nn.Linear, m_threshold: int = 64):
+        super().__init__()
+        self.weight = linear.weight                            # 复用 fp16 权重,不复制(显存中性)
+        self.bias = linear.bias
+        self.N, self.K = linear.weight.shape
+        self.m_threshold = m_threshold
+
+    @classmethod
+    def from_linear(cls, linear: nn.Linear, m_threshold: int = 64) -> "StageFP8Linear":
+        return cls(linear, m_threshold)
+
+    def forward(self, x):
+        shape = x.shape
+        M = 1
+        for s in shape[:-1]:
+            M *= s
+        if M < self.m_threshold:                              # decode:带宽受限,fp16 更快
+            return torch.nn.functional.linear(x, self.weight, self.bias)
+        # prefill / chunk:算力受限,FP8 per-tensor(直接出 fp16,避开 rowwise 的转换/量化开销)
+        x2d = x.reshape(-1, self.K)
+        sa = (x2d.abs().max() / 448.0).float()
+        xq = (x2d / sa).to(E4M3)
+        wscale = (self.weight.abs().max() / 448.0).float()                  # 标量,在线量化权重
+        wq = (self.weight / wscale).to(E4M3)
+        out = torch._scaled_mm(xq, wq.t(), scale_a=sa, scale_b=wscale, out_dtype=torch.float16)
+        if self.bias is not None:
+            out = out + self.bias
+        return out.reshape(*shape[:-1], self.N)
 
 
 def apply_fp8(model, scope: str = "gate_up") -> int:

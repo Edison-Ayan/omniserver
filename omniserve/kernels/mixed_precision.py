@@ -39,11 +39,14 @@ def _replace(layer, op: str, prec: str) -> int:
     if base == "fp8":
         from .fp8_linear import FP8Linear
         setattr(parent, attr, FP8Linear.from_linear(lin, hadamard=had))
+    elif base == "fp8a":                          # 按 M 自适应:prefill FP8 / decode fp16
+        from .fp8_linear import StageFP8Linear
+        setattr(parent, attr, StageFP8Linear.from_linear(lin))
     elif base == "marlin":
         from .marlin_linear import MarlinInt4Linear
         setattr(parent, attr, MarlinInt4Linear(lin, hadamard=had))
     else:
-        raise ValueError(f"未知精度 {prec!r}(支持 fp16/fp8/marlin,可带 +h 后缀)")
+        raise ValueError(f"未知精度 {prec!r}(支持 fp16/fp8/fp8a/marlin,可带 +h 后缀)")
     return 1
 
 

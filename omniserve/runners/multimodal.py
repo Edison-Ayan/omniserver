@@ -55,6 +55,27 @@ class MultimodalRunner(ModelRunner):
             if e not in sp.stop_token_ids:
                 sp.stop_token_ids.append(e)
 
+    def _match_seq(self, seq: Sequence):
+        """前缀匹配用的内容序列:图像占位 token 用其图像内容 hash 标记。否则不同图的占位 token id
+        相同 → 块哈希会把"不同图"误判成同前缀。纯文本时直接返回 token ids。
+        同一段图像 run 的所有 token 标同一个 key(同图 → 同标记 → 同前缀哈希)。"""
+        ids = seq.prompt_token_ids
+        keys = self._img_keys.get(seq.request_id)
+        if not keys:
+            return ids
+        out, k, cur, prev_img = [], 0, None, False
+        for t in ids:
+            if t == self.image_token_id:
+                if not prev_img:                               # 进入新的一段图像 run → 下一张图
+                    cur = f"img:{keys[k]}" if k < len(keys) else "img:?"
+                    k += 1
+                prev_img = True
+                out.append(cur)
+            else:
+                prev_img = False
+                out.append(t)
+        return out
+
     @torch.inference_mode()
     def prefill(self, seqs: List[Sequence]) -> None:
         """打包式 prefill + 前缀复用(compute 真算 / dup 同 batch 重复拷 KV / hit 跨 step 命中快照)。
@@ -77,15 +98,17 @@ class MultimodalRunner(ModelRunner):
                 entry = self.prefix_cache.get(keys[i], lambda x: x)
                 if entry is not None:
                     plan.append(("hit", entry)); continue
-                # 部分前缀复用(纯文本):和缓存共享最长块前缀 → 复用前缀 KV、只 prefill 后缀。
-                # MVP 限纯文本:图文要对齐图像块 + M-RoPE,留后续。
-                if self._pending[seq.request_id]["pixel_values"] is None:
-                    from ..cache.prefix import BLOCK
-                    mp = self.prefix_cache.match_prefix(seq.prompt_token_ids)
-                    if mp is not None and BLOCK <= mp[1] < seq.num_prompt_tokens:
-                        plan.append(("partial", mp))
-                        self.prefix_cache.stats.hits += 1
-                        continue
+                # 部分前缀复用(文本 / 图文):和缓存共享最长块前缀 → 复用前缀 KV、只 prefill 后缀。
+                # 要求**后缀里没有图像 token**(图必须整个落在复用前缀内),这样后缀是纯文本、
+                # 无需 vision_embed,且复用的图像 KV 完整;M-RoPE 用新请求自己的位置(同图同前缀 → 位置一致)。
+                from ..cache.prefix import BLOCK
+                mp = self.prefix_cache.match_prefix(self._match_seq(seq))
+                if mp is not None and BLOCK <= mp[1] < seq.num_prompt_tokens \
+                        and not (self._pending[seq.request_id]["ids"][0, mp[1]:]
+                                 == self.image_token_id).any():
+                    plan.append(("partial", mp))
+                    self.prefix_cache.stats.hits += 1
+                    continue
                 first_compute[keys[i]] = i
             plan.append(("compute", None))
             compute_idxs.append(i)
@@ -118,7 +141,7 @@ class MultimodalRunner(ModelRunner):
                     self.prefix_cache.put(keys[i], PrefixEntry(
                         cache=self._pool.snapshot_slot(slots[i], L_of[i]),
                         rope_delta=delta_of[i], length=L_of[i], first_token=first_tok[i],
-                        block_hashes=block_hashes(seqs[i].prompt_token_ids)))
+                        block_hashes=block_hashes(self._match_seq(seqs[i]))))
 
         # 2b) 部分前缀命中:恢复各自共享前缀 KV[0:matched],把所有后缀**打包进一次 append 前向**
         #     (复用 _MixedWriter:每段后缀注意到自己槽位里已恢复的前缀,段间独立)——避免逐序列小前向。
@@ -134,7 +157,8 @@ class MultimodalRunner(ModelRunner):
                 ks, vs = entry.cache                                      # 切前缀 KV[0:matched] 写进槽位
                 self._pool.restore_slot(
                     slot, ([k[:matched] for k in ks], [v[:matched] for v in vs]), matched)
-                pos_full, delta = self.adapter.prefill_positions(ids, None)
+                pos_full, delta = self.adapter.prefill_positions(
+                    ids, self._pending[seq.request_id]["grids"])      # M-RoPE 用真实 grids
                 delta_of[i] = delta
                 p_emb.append(self.adapter.embed_tokens(ids[:, matched:]))  # 只算后缀
                 p_pos.append(pos_full[:, :, matched:])
@@ -151,7 +175,7 @@ class MultimodalRunner(ModelRunner):
                     self.prefix_cache.put(keys[i], PrefixEntry(
                         cache=self._pool.snapshot_slot(slots[i], L_of[i]), rope_delta=delta_of[i],
                         length=L_of[i], first_token=first_tok[i],
-                        block_hashes=block_hashes(seq.prompt_token_ids)))
+                        block_hashes=block_hashes(self._match_seq(seq))))
 
         # 3) 落位
         for i, seq in enumerate(seqs):

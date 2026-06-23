@@ -276,6 +276,28 @@ and opens a low-loss region int4 can't reach; marlin (RTN) is Pareto-dominated b
 > "FP8 wins prefill" holds for the isolated GEMM but is erased end-to-end by per-token
 > quant + dtype-cast overhead at this scale. Keep `qkv`/`o` at fp16.
 
+### FP8 exploration ledger — measure-driven, including the negatives
+
+The whole FP8 effort, each step decided by measurement (kept *and* rejected):
+
+| tried | verdict | why (measured) |
+|---|---|---|
+| **FP8 MLP + fp16 attention** (mixed) | ✅ **kept** | best non-fp16 Pareto point: ≈gptq throughput at ~1/3 the quality loss, −20% mem |
+| per-tensor vs rowwise scales | ✅ per-tensor | rowwise's forced bf16→fp16 cast erased the prefill win; per-tensor 354→**398 tok/s** |
+| fused `scaled_fp8_quant` (vLLM op) | ✅ ported | mixed decode **+6.8%**; the eager amax reduce was ~3.7% of decode |
+| CUTLASS `scaled_mm` (vLLM's GEMM) | ❌ skipped | measured *slower* on Ada (146 vs 86 µs); CUTLASS FP8 is Hopper-tuned |
+| attention (qkv/o) → FP8 | ❌ rejected | fixed ~25 µs quant tax > the whole small GEMM; crossover only at M≥256 |
+| fuse quant into RMSNorm | ❌ rejected | fusing into a per-row norm forces per-token→rowwise→bf16 penalty > saved launch |
+| lm_head → FP8 | ❌ rejected | isolated 2.2×, text-decode +5.9%, but **+0.7% multimodal** (ViT-diluted) + mem/quality cost |
+
+**The through-line:** FP8 only pays when the GEMM is large enough to amortize a fixed
+quantization tax, *and* when decode is the end-to-end bottleneck. On this multimodal
+2B model neither holds for the small/attention GEMMs, and serial ViT prefill dilutes
+the decode-side knobs — so the real multimodal lever is the **vision/prefill side**
+(prefix caching, §12: image 17×), not deeper decode-side FP8. Knowing *why* each FP8
+idea did or didn't pay — fixed tax vs GEMM size, per-tensor vs rowwise, Amdahl vs ViT
+— is the deliverable.
+
 ## 11. Chunked + mixed prefill — long prompts stop stalling decode
 
 Each step was `prefill(whole) → decode(1 each)` as two forwards; a long prompt

@@ -259,6 +259,17 @@ and opens a low-loss region int4 can't reach; marlin (RTN) is Pareto-dominated b
 > directly) lifted mixed from 354.8 → **398.8 tok/s**. Rowwise stays opt-in for heavy
 > outliers; text activations don't need it (rel 0.0143 vs 0.0147, measured).
 
+> ⚠️ **vs vLLM's FP8, and what we ported.** Compared `FP8Linear` to vLLM 0.12's FP8
+> path. Two differences: (1) vLLM quantizes activations with a **fused** CUDA op
+> (`ops.scaled_fp8_quant`, amax+scale+cast in one kernel) vs our eager amax→div→cast
+> (3 launches); (2) vLLM's GEMM is `cutlass_scaled_mm`. We ported (1) — it's the right
+> Ada call — but **not** (2): measured on sm_89, `cutlass_scaled_mm` is *slower*
+> (rowwise 146 vs torch `_scaled_mm` 86 µs); CUTLASS FP8 is tuned for Hopper, so
+> `torch._scaled_mm` (fp16 out) is already the right Ada choice. Porting the fused
+> quant lifted **mixed decode +6.8%** (814 → 869 tok/s, batch 8), quality unchanged
+> (ppl 73.4 vs eager 74.7 — if anything better). The earlier profile localized this:
+> the eager amax reduce was ~3.7% of decode on its own.
+
 > ⚠️ **attention FP8 — measured *not* worth it.** Quantizing `qkv`/`o` to FP8 (W8A8),
 > even stage-aware (FP8 prefill / fp16 decode, `StageFP8Linear`), gives no net win on
 > this model: decode ≈ mixed, prefill ≤ mixed, memory unchanged. The micro-bench

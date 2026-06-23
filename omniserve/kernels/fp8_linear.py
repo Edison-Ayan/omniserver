@@ -20,6 +20,26 @@ from torch import nn
 
 E4M3 = torch.float8_e4m3fn
 
+_VLLM_QUANT = None  # vLLM 融合 per-tensor 量化 op(scaled_fp8_quant),惰性探测
+
+
+def _quant_fp8_pertensor(x2d):
+    """per-tensor 动态量化成 FP8,返回 (fp8 [M,K], scale)。
+    优先用 vLLM 的融合 CUDA op `scaled_fp8_quant`(amax+scale+cast 一发,~22us;对标 vLLM 做法),
+    没有 vLLM 时退化成 eager amax+div+cast(~27us,多发 launch)。Ada 上仍用 torch._scaled_mm 出
+    fp16(实测 cutlass_scaled_mm 在 sm_89 反而更慢,故只学融合量化、不学 cutlass GEMM)。"""
+    global _VLLM_QUANT
+    if _VLLM_QUANT is None:
+        try:
+            from vllm import _custom_ops as ops
+            _VLLM_QUANT = ops.scaled_fp8_quant
+        except Exception:
+            _VLLM_QUANT = False
+    if _VLLM_QUANT:
+        return _VLLM_QUANT(x2d.contiguous())               # per-tensor dynamic,融合一发
+    sa = (x2d.abs().max() / 448.0).float()                 # eager 退化
+    return (x2d / sa).to(E4M3), sa
+
 
 @triton.jit
 def _quant_fwd(X, Y, S, stride, N, BLOCK: tl.constexpr):
@@ -76,6 +96,17 @@ class FP8Linear(nn.Module):
         """从 fp16 nn.Linear 构造,和 MarlinInt4Linear(linear) 用法对齐(per-op 替换用)。"""
         return cls(linear.weight.data, linear.bias, hadamard=hadamard, rowwise=rowwise)
 
+    def forward_prequant(self, xq, scale):
+        """输入已是 fp8 + per-token scale(上游融合 norm 直接吐出),跳过自身量化 —— 这是融合
+        RMSNorm→FP8 省掉那笔独立量化 launch 的关键。rowwise scaled_mm 输出 **bf16**(不转 fp16,
+        留给下游 silu_mul / 下一个量化消费,避免大 N 的转换税)。要求 rowwise=True(per-channel 权重 scale)。
+        xq: [M,K] fp8;scale: [M,1] fp32。返回 [M,N] bf16。"""
+        out = torch._scaled_mm(xq, self.wq.t(), scale_a=scale, scale_b=self.wscale,
+                               out_dtype=torch.bfloat16)
+        if self.bias is not None:
+            out = out + self.bias.to(out.dtype)
+        return out
+
     def forward(self, x):
         shape = x.shape
         if self.hadamard:                                    # 激活在线旋转 a·H
@@ -87,8 +118,7 @@ class FP8Linear(nn.Module):
                                    out_dtype=torch.bfloat16).to(torch.float16)
         else:                                                # per-tensor 激活,直接出 fp16(省转换)
             x2d = x.reshape(-1, self.K)
-            sa = (x2d.abs().max() / 448.0).float()
-            xq = (x2d / sa).to(E4M3)
+            xq, sa = _quant_fp8_pertensor(x2d)               # 融合量化(vLLM scaled_fp8_quant,退化 eager)
             out = torch._scaled_mm(xq, self.wq.t(), scale_a=sa, scale_b=self.wscale,
                                    out_dtype=torch.float16)
         if self.bias is not None:

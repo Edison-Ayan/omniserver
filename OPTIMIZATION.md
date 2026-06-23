@@ -447,6 +447,8 @@ and only at int4:
 | **fused decode kernels** (norm+rope+residual+quant in fewer kernels) | **vLLM-only** — ~the int4 decode gap (9.5 vs ~7–8 ms); years of kernel work |
 | **overlapped batched prefill** (chunked, ViT batched + prefill/decode overlap) | **vLLM-only** — the int4 cold-prefill gap; omniserve runs ViT serially per image |
 | varlen / chunked-mixed prefill (fp16 too) | **done (§11)** — varlen append attention; chunked + mixed batching, 4.39x ITL stall reduction |
+| FP8 activation quant (vs vLLM's fused op) | **done (§10)** — ported `scaled_fp8_quant`, mixed decode +6.8%; cutlass GEMM measured slower on Ada, not ported |
+| decode weight-bandwidth (lm_head / W4A16-MLP) | **measured, ViT-diluted** — lm_head→FP8 is +5.9% *text* decode but only +0.7% multimodal end-to-end (`bench_lmhead_fp8.py`); gptq-int4 ≈ FP8 mixed end-to-end (397.7 vs 398.8) too. Pure-decode profile (lm_head 25%, MLP GEMM 46.6%) overstates it — the multimodal run is dominated by **serial ViT prefill**, so the decode-side knob barely moves the needle |
 | lean C++ forward | not pursued — a rewrite, marginal given the above |
 
 The honest bottom line: **at fp16, on a fair benchmark, the from-scratch engine is

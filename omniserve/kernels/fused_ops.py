@@ -70,6 +70,43 @@ def add_rms_norm(x, residual, weight, eps):
     return out.reshape(x.shape), nres.reshape(residual.shape)
 
 
+# ---------------- 残差 add + RMSNorm + FP8 量化 融合 ----------------
+@triton.jit
+def _add_rms_fp8_fwd(X, RES, W, Y, SCALE, NRES, stride, N, eps, BLOCK: tl.constexpr):
+    """在 add_rms 的同一个 per-row program 里顺手把 normed 结果量化成 FP8(per-token scale)。
+    norm 本来就按行 reduce,行内 amax 几乎免费 —— 省掉下游 FP8 GEMM 那笔独立的量化 launch。"""
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < N
+    x = tl.load(X + row * stride + cols, mask=mask, other=0.0).to(tl.float32)
+    r = tl.load(RES + row * stride + cols, mask=mask, other=0.0).to(tl.float32) + x
+    r16 = r.to(NRES.dtype.element_ty)
+    tl.store(NRES + row * stride + cols, r16, mask=mask)         # 新残差(fp16)穿层传递
+    rf = r16.to(tl.float32)
+    rstd = 1.0 / tl.sqrt(tl.sum(rf * rf, axis=0) / N + eps)
+    w = tl.load(W + cols, mask=mask, other=0.0).to(tl.float32)
+    y = rf * rstd * w                                            # fp32 normed
+    scale = tl.maximum(tl.max(tl.abs(y), axis=0) / 448.0, 1e-12)  # per-token scale(行内 amax)
+    tl.store(Y + row * N + cols, (y / scale).to(Y.dtype.element_ty), mask=mask)  # 直接吐 fp8
+    tl.store(SCALE + row, scale)
+
+
+def add_rms_norm_fp8(x, residual, weight, eps):
+    """= add_rms_norm,但 normed 输出直接量化成 FP8(e4m3, per-token scale)。
+    返回 (fp8_out [M,N], scale [M,1] fp32, new_residual)。供 gate_up 等 FP8 GEMM 免量化消费。"""
+    n = x.shape[-1]
+    x2d = x.reshape(-1, n).contiguous()
+    res2d = residual.reshape(-1, n).contiguous()
+    m = x2d.shape[0]
+    out = torch.empty(m, n, device=x2d.device, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(m, 1, device=x2d.device, dtype=torch.float32)
+    nres = torch.empty_like(res2d)
+    block = triton.next_power_of_2(n)
+    _add_rms_fp8_fwd[(m,)](x2d, res2d, weight, out, scale, nres, x2d.stride(0), n, eps,
+                           BLOCK=block, num_warps=max(1, min(16, block // 256)))
+    return out, scale, nres.reshape(residual.shape)
+
+
 # ---------------- SiLU(gate) * up 融合 ----------------
 @triton.jit
 def _silu_mul_fwd(GU, Y, s_in, s_out, N, BLOCK: tl.constexpr):

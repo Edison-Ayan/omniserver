@@ -41,11 +41,16 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.eps = eps
+        self.fp8_out = False   # 置 True 时直接吐 (fp8, scale)(融合量化,见 fuse_norm_fp8)
 
     def forward(self, x, residual=None):
         # 用融合 Triton kernel:无残差 -> rms_norm;有残差 -> add_rms_norm
         # (残差 add 折进 norm,返回 (normed, new_residual))。
-        from ..kernels.fused_ops import add_rms_norm, rms_norm
+        from ..kernels.fused_ops import add_rms_norm, add_rms_norm_fp8, rms_norm
+        if self.fp8_out and residual is not None:
+            # 把下游 FP8 GEMM 的激活量化折进 norm:返回 ((fp8, scale), new_residual)
+            fq, scale, nres = add_rms_norm_fp8(x, residual, self.weight, self.eps)
+            return (fq, scale), nres
         if residual is None:
             return rms_norm(x, self.weight, self.eps)
         return add_rms_norm(x, residual, self.weight, self.eps)
@@ -117,7 +122,16 @@ class MLP(nn.Module):
 
     def forward(self, x):
         from ..kernels.fused_ops import silu_mul
-        return self.down_proj(silu_mul(self.gate_up_proj(x)))   # silu(gate)*up 一个 kernel
+        if isinstance(x, tuple):                            # 融合路径:上游 norm 已吐 (fp8, scale)
+            xq, scale = x                                   # gate_up 免量化,bf16 直流进 silu_mul(无转换税)
+            gu = self.gate_up_proj.forward_prequant(xq, scale)
+        else:
+            gu = self.gate_up_proj(x)
+        out = silu_mul(gu)                                  # silu(gate)*up 一个 kernel
+        # down 若是 FP8(有 forward_prequant)能直接吃 bf16(自己量化);否则(fp16)需转回 fp16
+        if out.dtype != torch.float16 and not hasattr(self.down_proj, "forward_prequant"):
+            out = out.to(torch.float16)
+        return self.down_proj(out)
 
 
 class DecoderLayer(nn.Module):
@@ -136,8 +150,10 @@ class DecoderLayer(nn.Module):
         else:
             x, residual = self.input_layernorm(x, residual)
         x = self.self_attn(x, cos, sin, attn_mask, cache, layer_idx)
-        x, residual = self.post_attention_layernorm(x, residual)
+        x, residual = self.post_attention_layernorm(x, residual)   # fp8_out 时 x=(fp8, scale)
         x = self.mlp(x)
+        if x.dim() == 2:                                  # 融合路径输出是展平的 [M,H],还原成 [B,L,H]
+            x = x.view(residual.shape)
         return x, residual
 
 

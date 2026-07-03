@@ -50,6 +50,29 @@ def _replace(layer, op: str, prec: str) -> int:
     return 1
 
 
+def fuse_norm_fp8(model) -> int:
+    """把 gate_up 的激活量化**折进 post_attention_layernorm**(消除下游那笔独立量化 launch)。
+
+    micro-bench 探因:FP8 的 scaled_mm 本身常比 fp16 快,拖死它的是独立的激活量化 launch(~25us)。
+    norm 本来就按行 reduce,顺手吐 fp8+per-token scale 几乎免费 → gate_up 免量化、bf16 直流进 silu_mul
+    (无转换税)。只动 gate_up(输入来自 RMSNorm);o/down 输入非 norm,不动。
+
+    在 **fp16 模型上调用**(gate_up 还是 nn.Linear):把 gate_up 建成 rowwise FP8(per-channel 权重
+    scale,配 norm 的 per-token 激活 scale),并置 post_attention_layernorm.fp8_out。返回融合层数。"""
+    import torch.nn as nn
+    from .fp8_linear import FP8Linear
+    n = 0
+    for layer in model.layers:
+        gu = layer.mlp.gate_up_proj
+        if isinstance(gu, nn.Linear):
+            layer.mlp.gate_up_proj = FP8Linear.from_linear(gu, rowwise=True)
+        elif isinstance(gu, FP8Linear) and not gu.rowwise:
+            raise ValueError("gate_up 已是 per-tensor FP8;融合需 rowwise,请在量化前调用 fuse_norm_fp8")
+        layer.post_attention_layernorm.fp8_out = True
+        n += 1
+    return n
+
+
 def apply_mixed(model, plan: dict | None = None) -> dict:
     """按 per-op plan 替换 model.layers 各 Linear。返回 {算子: (精度, 替换层数)} 供日志。"""
     plan = plan or DEFAULT_PLAN
